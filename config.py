@@ -290,12 +290,10 @@ CFG = {
                 "max_concurrency": 16,
                 "weight": 1,
             },
-            # 第二台 MinerU：把 url / server_url 换成实际地址，再把 enabled 改成 True。
             {
                 "name": "mineru_2",
-                "enabled": False,
-                "url": "http://请填写第二台地址:8000",
-                "server_url": "http://请填写第二台地址:30000",
+                "url": "http://10.107.226.27:8001",
+                "server_url": "http://10.107.226.27:30001",
                 "max_concurrency": 16,
                 "weight": 1,
             },
