@@ -219,6 +219,8 @@ CFG = {
         "vlm_max_pending": 8,
         "vlm_min_interval_seconds": 0.0,
         "cooldown_refresh_seconds": 1.0,
+        "generation_progress_every": 10,
+        "generation_progress_seconds": 60.0,
         "generation_state_flush_every": 20,
         "generation_state_flush_seconds": 10.0,
         "reuse_mineru": False,

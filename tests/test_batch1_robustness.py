@@ -268,3 +268,86 @@ class GenerationCheckpointFlushTests(unittest.TestCase):
             with self.assertLogs(pipeline._state_logger(cfg), level="WARNING") as captured:
                 self.assertEqual(pipeline._read_generation_state(output_dir, cfg), {})
             self.assertIn("checkpoint unreadable", "\n".join(captured.output))
+
+
+class GenerationProgressLogTests(unittest.TestCase):
+    """生成阶段原本完全静默，几十分钟看不到动静。"""
+
+    def _run(self, job_count, **runtime):
+        import logging
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from journal_cpt.app import pipeline
+
+        base = {
+            "max_workers": 1,
+            "vlm_max_pending": 1,
+            "generation_progress_every": 2,
+            "generation_progress_seconds": 9999.0,
+        }
+        base.update(runtime)
+        cfg = {
+            "task_types": ["section_keypoint_summary"],
+            "paths": {"sample_raw": "samples/raw/{task_type}.jsonl"},
+            "runtime": base,
+        }
+        journal = SimpleNamespace(journal_id="j1")
+        jobs = [
+            SimpleNamespace(task_type="section_keypoint_summary", journal=journal,
+                            page=SimpleNamespace(page_index=i), article=None, block=None)
+            for i in range(job_count)
+        ]
+        logger = logging.getLogger("journal_cpt_progress_test")
+        state = SimpleNamespace(error=lambda payload: None, logger=logger)
+
+        def fake_generate(job, *_args):
+            return [{"id": f"s{job.page.page_index}", "task_type": "section_keypoint_summary"}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(pipeline, "generate_for_job", side_effect=fake_generate):
+                with self.assertLogs(logger, level="INFO") as captured:
+                    pipeline._generate_samples_for_jobs(
+                        jobs=jobs, output_dir=Path(tmp), cfg=cfg, vlm=None, state=state,
+                    )
+        return [line for line in captured.output if "generate progress" in line]
+
+    def test_progress_is_logged_during_generation(self) -> None:
+        lines = self._run(job_count=6)
+        self.assertTrue(lines, "生成阶段必须打进度")
+        self.assertIn("jobs=6/6", lines[-1])
+        self.assertIn("samples=6", lines[-1])
+
+    def test_progress_reports_eta_and_failures(self) -> None:
+        lines = self._run(job_count=4)
+        self.assertIn("预计剩余", lines[-1])
+        self.assertIn("failed=0", lines[-1])
+
+    def test_final_progress_is_always_emitted(self) -> None:
+        # job 数少于 progress_every 时，中途不打，但收尾必须打一条
+        lines = self._run(job_count=1, generation_progress_every=100)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("jobs=1/1", lines[0])
+
+    def test_missing_logger_on_state_does_not_crash(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from journal_cpt.app import pipeline
+
+        cfg = {
+            "task_types": ["section_keypoint_summary"],
+            "paths": {"sample_raw": "samples/raw/{task_type}.jsonl"},
+            "runtime": {"max_workers": 1, "vlm_max_pending": 1},
+            "logger_name": "journal_cpt_test",
+        }
+        journal = SimpleNamespace(journal_id="j1")
+        jobs = [SimpleNamespace(task_type="section_keypoint_summary", journal=journal,
+                                page=SimpleNamespace(page_index=0), article=None, block=None)]
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(pipeline, "generate_for_job", return_value=[{"id": "s", "task_type": "section_keypoint_summary"}]):
+                samples = pipeline._generate_samples_for_jobs(
+                    jobs=jobs, output_dir=Path(tmp), cfg=cfg, vlm=None,
+                    state=SimpleNamespace(error=lambda payload: None),   # 没有 .logger
+                )
+        self.assertEqual(len(samples), 1)

@@ -326,6 +326,38 @@ def _generate_samples_for_jobs(
             return sample_count == 0 or raw_count >= sample_count
         return raw_count > 0
 
+    progress_logger = getattr(state, "logger", None) or _state_logger(cfg)
+    progress_every = max(1, int(cfg["runtime"].get("generation_progress_every", 10)))
+    progress_seconds = max(0.0, float(cfg["runtime"].get("generation_progress_seconds", 60.0)))
+    progress_journal_id = str(getattr(getattr(jobs[0], "journal", None), "journal_id", "")) if jobs else ""
+    started_at = time.monotonic()
+    done_jobs = 0
+    last_progress_at = started_at
+
+    def log_progress(force: bool = False) -> None:
+        """生成阶段原本从 jobs=N 到 completed 之间一条日志都没有，几十分钟看不到任何动静。"""
+        nonlocal last_progress_at
+        now = time.monotonic()
+        if not force and done_jobs % progress_every and now - last_progress_at < progress_seconds:
+            return
+        if not force and done_jobs == 0:
+            return
+        last_progress_at = now
+        elapsed = max(1e-6, now - started_at)
+        rate = done_jobs / elapsed
+        remaining = max(0, len(jobs) - done_jobs)
+        eta = remaining / rate if rate > 0 else 0.0
+        progress_logger.info(
+            "generate progress journal_id=%s jobs=%s/%s samples=%s failed=%s 用时=%.1f分 预计剩余=%.1f分",
+            progress_journal_id,
+            done_jobs,
+            len(jobs),
+            len(raw_sample_rows),
+            len(failures),
+            elapsed / 60.0,
+            eta / 60.0,
+        )
+
     flush_every = max(1, int(cfg["runtime"].get("generation_state_flush_every", 20)))
     flush_seconds = max(0.0, float(cfg["runtime"].get("generation_state_flush_seconds", 10.0)))
     unflushed = 0
@@ -410,6 +442,9 @@ def _generate_samples_for_jobs(
                 mark_job_completed(job, job_key, samples)
             except Exception as exc:
                 record_failure(job, exc)
+            done_jobs += 1
+            log_progress()
+        log_progress(force=True)
         flush_generation_state(force=True)
         raise_if_all_failed()
         return ordered_raw_samples()
@@ -438,9 +473,14 @@ def _generate_samples_for_jobs(
                     samples = future.result()
                 except Exception as exc:
                     record_failure(job, exc)
+                    done_jobs += 1
+                    log_progress()
                     continue
                 add_samples(job_index, samples)
                 mark_job_completed(job, job_key, samples)
+                done_jobs += 1
+                log_progress()
+    log_progress(force=True)
     flush_generation_state(force=True)
     raise_if_all_failed()
     return ordered_raw_samples()
