@@ -462,6 +462,74 @@ def _model_context(job: JournalSampleJob, cfg: dict[str, Any]) -> dict[str, Any]
     }
 
 
+_DEDUPE_MIN_CHARS = 200
+
+
+def _dedupe_payload(value: Any, seen: dict[str, str], path: str) -> Any:
+    """把逐字节完全相同的子树替换成指向首次出现位置的短引用。
+
+    同一份版面块会以 context.template_input.layout_blocks、context.layout_blocks、
+    context.source.page.blocks 等多个键重复出现，整页正文也会以 ocr_text /
+    paragraph_text / page_ocr / page_paragraph_text / full_text 反复出现。
+    实测单页任务里 105K 字符有 51K 是纯重复，跨页任务直接把 prompt 顶到
+    max_model_len 之外被服务端拒掉。
+
+    这里只合并「序列化后逐字节相同」的子树，键本身保留、指向首次出现的位置，
+    所以模型能看到的信息一条不少，只是不再重复看。任务提示词不受影响。
+    """
+    if isinstance(value, dict):
+        return {key: _dedupe_payload(item, seen, f"{path}.{key}" if path else str(key)) for key, item in value.items()}
+    if isinstance(value, list):
+        serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        if len(serialized) >= _DEDUPE_MIN_CHARS:
+            first = seen.get(serialized)
+            if first is not None:
+                return f"<同 {first}，内容不再重复>"
+            seen[serialized] = path
+        return [_dedupe_payload(item, seen, f"{path}[{index}]") for index, item in enumerate(value)]
+    if isinstance(value, str) and len(value) >= _DEDUPE_MIN_CHARS:
+        first = seen.get(value)
+        if first is not None:
+            return f"<同 {first}，内容不再重复>"
+        seen[value] = path
+    return value
+
+
+def _payload_chars(payload: dict[str, Any]) -> int:
+    return len(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _largest_shrinkable(context: dict[str, Any]) -> str:
+    """挑 context 里最大的可裁剪键；template_input 是任务主输入，最后才动。"""
+    sizes = {
+        key: len(json.dumps(item, ensure_ascii=False, default=str))
+        for key, item in context.items()
+        if key != "template_input" and not str(item).startswith("<同 ")
+    }
+    return max(sizes, key=lambda key: sizes[key]) if sizes else ""
+
+
+def _enforce_prompt_budget(payload: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    """超预算时按体积从大到小省略 context 下的辅助字段，直到装得下。
+
+    不裁 template_input：那是任务本身的输入。辅助字段（source、page_window、
+    layout_blocks 之类）省略后会留一句说明，而不是静默消失。
+    """
+    if max_chars <= 0:
+        return payload
+    context = payload.get("context")
+    if not isinstance(context, dict):
+        return payload
+    for _ in range(len(context)):
+        if _payload_chars(payload) <= max_chars:
+            return payload
+        key = _largest_shrinkable(context)
+        if not key:
+            break
+        context[key] = f"<超出 prompt 预算 {max_chars} 字符，本字段已省略>"
+    return payload
+
+
 def _prompt(job: JournalSampleJob, cfg: dict[str, Any]) -> str:
     spec = TASK_SPECS[job.task_type]
     if spec["format"] == "pt":
@@ -487,6 +555,8 @@ def _prompt(job: JournalSampleJob, cfg: dict[str, Any]) -> str:
         "context": _model_context(job, cfg),
         "expected_count": cfg["generation"]["samples_per_job"].get(job.task_type, 1),
     }
+    payload = _dedupe_payload(payload, {}, "")
+    payload = _enforce_prompt_budget(payload, int(cfg["generation"].get("max_prompt_chars", 0)))
     prompt = str(cfg["prompts"][job.task_type]).strip()
     instruction_rule = (
         "请生成训练样本而不是直接解释任务。每条样本的 instruction 必须围绕当前任务和当前证据自然提问；"

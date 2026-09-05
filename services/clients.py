@@ -658,6 +658,16 @@ def _escape_unescaped_inner_quotes(text: str) -> str:
     return "".join(chars)
 
 
+def _loads_json(text: str) -> Any:
+    """按非严格模式解析。
+
+    strict=False 只放开一件事：允许字符串内出现未转义的控制字符（真实换行、制表符）。
+    大模型写多行 answer 时经常直接敲回车而不是 \n，标准 json.loads 会报
+    "Invalid control character"，整条响应就废了。其余语法仍然严格校验。
+    """
+    return json.loads(text, strict=False)
+
+
 def _loads_json_array(text: str) -> Any:
     extracted = _extract_json_array(text)
     without_trailing_commas = _remove_trailing_commas(extracted)
@@ -673,11 +683,12 @@ def _loads_json_array(text: str) -> Any:
     last_error: json.JSONDecodeError | None = None
     for candidate in candidates:
         try:
-            return json.loads(candidate)
+            return _loads_json(candidate)
         except json.JSONDecodeError as exc:
             last_error = exc
     if last_error is not None:
-        raise ValueError(f"VLM response is not valid JSON array: {last_error}") from last_error
+        preview = text.strip()[:200].replace("\n", "\\n")
+        raise ValueError(f"VLM response is not valid JSON array: {last_error} | 响应开头: {preview!r}")
     raise ValueError("VLM response is empty.")
 
 
@@ -702,14 +713,14 @@ def parse_jsonl_objects(text: str) -> list[dict[str, Any]]:
         if not candidate or candidate in {"[", "]"} or candidate.startswith("```"):
             continue
         try:
-            payload = json.loads(candidate)
+            payload = _loads_json(candidate)
         except json.JSONDecodeError:
             start = candidate.find("{")
             end = candidate.rfind("}")
             if start < 0 or end <= start:
                 continue
             try:
-                payload = json.loads(candidate[start : end + 1])
+                payload = _loads_json(candidate[start : end + 1])
             except json.JSONDecodeError:
                 continue
         if isinstance(payload, dict):
@@ -719,7 +730,7 @@ def parse_jsonl_objects(text: str) -> list[dict[str, Any]]:
         return rows
 
     try:
-        payload = json.loads(stripped)
+        payload = _loads_json(stripped)
     except json.JSONDecodeError as exc:
         raise ValueError(f"VLM response is not valid JSONL/JSON: {exc}") from exc
     if isinstance(payload, dict):

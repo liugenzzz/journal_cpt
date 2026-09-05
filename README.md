@@ -93,6 +93,30 @@ pypdf 打不开的 PDF（截断、加密、结构损坏）会被**跳过**，不
 
 注意 `processing/ingest.py` 的 `page_count()` 读页数时有 pypdf → PyMuPDF → 正则三级兜底，所以坏文件照样能被扫描进来，拦截点在水印清洗这一步。PyMuPDF 能读而 pypdf 读不了的文件目前也一并跳过。
 
+## Prompt payload 装配
+
+任务提示词本身（`config.py` 的 `PROMPTS`、`tasks/generation.py` 的 `instruction_rule`）不做任何改动，只处理装配进 `Input JSON` 的数据部分：
+
+- **逐字节去重**：同一份版面块会以 `template_input.layout_blocks`、`layout_blocks`、`source.page.blocks` 等多个键重复出现，整页正文也会以 `ocr_text` / `paragraph_text` / `page_ocr` / `page_paragraph_text` / `full_text` 反复出现。序列化后完全相同的子树只保留首次出现，其余替换成 `<同 xxx，内容不再重复>` 的短引用——键仍在、信息一条不少，只是不再重复。
+- **字符预算**：`generation.max_prompt_chars`（默认 80000）。超了按体积从大到小省略 `context` 下的辅助字段并留下说明，`template_input` 永不裁剪。设为 0 关闭。
+
+实测（24 块的双栏页）：
+
+| 任务 | 改前 | 改后 |
+|---|---|---|
+| `page_to_journal_layout_description` | 123,943 | 40,117 |
+| `figure_table_formula_to_text` | 94,835 | 42,124 |
+| `cross_page_article_context` | 387,897 | 43,759 |
+| `article_contribution_conclusion` | 824,903 | 56,337 |
+
+四个任务全部靠去重就装进预算，没有触发省略，即没有丢任何内容。
+
+`vlm_pool` 各 provider 的 `max_tokens` 是**输出**上限，不是上下文窗口。设成与 `max_model_len` 同量级会让服务端算出 `max_model_len - prompt_len` 为负而直接 400（`max_tokens must be at least 1, got -6196`），因此设为 8192。
+
+## 模型返回 JSON 的容错
+
+模型写多行 answer 时经常直接敲回车而不是 `\n`，标准 `json.loads` 会报 `Invalid control character` 让整条响应作废。解析统一走 `strict=False`，只放开「字符串内的未转义控制字符」，其余语法仍严格校验。解析彻底失败时错误信息会带上响应开头 200 字，方便判断模型到底返回了什么。
+
 ## 思维链（think）处理
 
 除 MinerU 外的生成模型都是推理模型，默认会输出思维链，因此请求和响应两侧都做了处理：
