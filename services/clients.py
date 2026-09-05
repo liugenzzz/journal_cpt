@@ -329,6 +329,11 @@ class _PooledVlmClient:
         with self._lock:
             self._cooldown_until = 0.0
 
+    @property
+    def free_slots(self) -> int:
+        with self._lock:
+            return self.max_concurrency - self._active
+
     def supports(self, task_type: str, has_images: bool) -> bool:
         if self.cfg.get("enabled") is False:
             return False
@@ -338,20 +343,38 @@ class _PooledVlmClient:
             return False
         return True
 
-    def chat(self, prompt: str, images: list[Path] | None = None) -> VlmResponse:
+    def try_acquire(self) -> bool:
+        """非阻塞占一个槽位；占不到立刻返回 False，让调用方去问下一个 provider。"""
+        if not self._semaphore.acquire(blocking=False):
+            return False
+        with self._lock:
+            self._active += 1
+        return True
+
+    def acquire(self) -> None:
         self._semaphore.acquire()
         with self._lock:
             self._active += 1
+
+    def release(self) -> None:
+        with self._lock:
+            self._active -= 1
+        self._semaphore.release()
+
+    def chat_acquired(self, prompt: str, images: list[Path] | None = None) -> VlmResponse:
+        """调用方已经持有本 provider 的槽位。"""
+        return VlmResponse(
+            text=self.client.chat(prompt, images),
+            provider_name=self.name,
+            model=self.model,
+        )
+
+    def chat(self, prompt: str, images: list[Path] | None = None) -> VlmResponse:
+        self.acquire()
         try:
-            return VlmResponse(
-                text=self.client.chat(prompt, images),
-                provider_name=self.name,
-                model=self.model,
-            )
+            return self.chat_acquired(prompt, images)
         finally:
-            with self._lock:
-                self._active -= 1
-            self._semaphore.release()
+            self.release()
 
 
 class VlmPool:
@@ -372,6 +395,9 @@ class VlmPool:
         self._now_fn = now_fn or time.monotonic
         self._rr_index = 0
         self._lock = threading.Lock()
+        # 任一 provider 释放槽位时唤醒等待者，实现"谁先空谁拿下一个任务"。
+        self._slot_available = threading.Condition()
+        self._acquire_poll_seconds = 0.5
 
     @classmethod
     def from_config(cls, cfg: dict[str, Any], prompts: dict[str, str]) -> "VlmPool":
@@ -423,11 +449,14 @@ class VlmPool:
         requirement = "image-capable " if has_images else ""
         raise RuntimeError(f"No {requirement}VLM provider is configured for task_type={task_type}.")
 
-    def _ranked_candidates(self, task_type: str, has_images: bool) -> tuple[list[_PooledVlmClient], bool]:
-        candidates = self._candidates(task_type, has_images)
+    def _ordered_candidates(self, candidates: list[_PooledVlmClient]) -> list[_PooledVlmClient]:
+        """按空闲程度排序：刚跑完的 provider 占用率最低，会排在最前面。
+
+        用占用率而不是绝对请求数，是为了让 max_concurrency 不同的 provider 之间按容量公平；
+        慢的 provider 请求压在手里更久，占用率一直偏高，自然就少分到任务。
+        """
         now = float(self._now_fn())
         available = [client for client in candidates if not client.is_cooling_down(now)]
-        all_cooling_down = not available
         if available:
             candidates = available
         with self._lock:
@@ -440,20 +469,49 @@ class VlmPool:
                 ((item[0] - start) % len(candidates)) / item[1].weight,
             )
         )
-        return [client for _, client in indexed], all_cooling_down
+        return [client for _, client in indexed]
+
+    def _acquire_free(self, candidates: list[_PooledVlmClient]) -> _PooledVlmClient | None:
+        """抢下第一个有空槽的 provider；全忙就等到有人释放为止。
+
+        关键在于不阻塞在某个被"指派"的 provider 上：只要还有别的 provider 空着，
+        当前线程立刻用那一个。谁先跑完谁先释放槽位，也就先接到下一个任务。
+        """
+        if not candidates:
+            return None
+        with self._slot_available:
+            while True:
+                for client in self._ordered_candidates(candidates):
+                    if client.try_acquire():
+                        return client
+                self._slot_available.wait(timeout=self._acquire_poll_seconds)
+
+    def _release(self, client: _PooledVlmClient) -> None:
+        # 先彻底释放 provider 自己的锁，再去拿条件变量，避免和等待者形成反向加锁顺序。
+        client.release()
+        with self._slot_available:
+            self._slot_available.notify_all()
 
     def chat(self, task_type: str, prompt: str, images: list[Path] | None = None) -> VlmResponse:
         has_images = bool(images)
-        candidates, all_cooling_down = self._ranked_candidates(task_type, has_images)
+        candidates = self._candidates(task_type, has_images)
+        now = float(self._now_fn())
+        all_cooling_down = all(client.is_cooling_down(now) for client in candidates)
         if self.fallback_enabled:
             attempts = len(candidates) if all_cooling_down else min(len(candidates), self.max_attempts)
         else:
             attempts = 1
         last_error: Exception | None = None
         attempt_errors: list[str] = []
-        for client in candidates[:attempts]:
+        tried: set[int] = set()
+        for _ in range(attempts):
+            remaining = [client for client in candidates if id(client) not in tried]
+            client = self._acquire_free(remaining)
+            if client is None:
+                break
+            tried.add(id(client))
             try:
-                response = client.chat(prompt, images)
+                response = client.chat_acquired(prompt, images)
                 client.mark_success()
                 return response
             except Exception as exc:
@@ -462,6 +520,8 @@ class VlmPool:
                 client.mark_failure(self.cooldown_seconds, float(self._now_fn()))
                 if not self.fallback_enabled:
                     break
+            finally:
+                self._release(client)
         if last_error is not None:
             detail = " | ".join(attempt_errors) if attempt_errors else str(last_error)
             raise RuntimeError(f"All attempted VLM providers failed for task_type={task_type}: {detail}") from last_error

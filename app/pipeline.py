@@ -570,13 +570,35 @@ def _cfg_for_task_types(cfg: dict[str, Any], task_types: list[str]) -> dict[str,
     return _select_task_types(deepcopy(cfg), task_types)
 
 
+def _scale_provider_quota(cfg: dict[str, Any], divisor: int) -> None:
+    """按 journal 进程数摊薄 provider 配额。
+
+    journal 级用的是 ProcessPoolExecutor，VlmPool 里的信号量和限流状态都是进程内的，
+    每个子进程各建一份。不摊薄的话 provider 实际承受的并发是配置值的 journal_workers 倍。
+    """
+    if divisor <= 1:
+        return
+    providers = cfg.get("vlm_pool", {}).get("providers")
+    if not isinstance(providers, list):
+        return
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        declared = max(1, int(provider.get("max_concurrency") or 1))
+        provider["max_concurrency"] = max(1, declared // divisor)
+        interval = float(provider.get("min_interval_seconds") or 0.0)
+        if interval > 0:
+            provider["min_interval_seconds"] = interval * divisor
+
+
 def _build_vlm_pool(cfg: dict[str, Any]) -> VlmPool:
+    journal_workers = max(1, int(cfg["runtime"].get("journal_workers", 1)))
     cfg = deep_merge(
         cfg,
         {
             "vlm_pool": {
                 "provider_defaults": {
-                    "min_interval_seconds": float(cfg["runtime"].get("vlm_min_interval_seconds", 0.0)),
+                    "min_interval_seconds": float(cfg["runtime"].get("vlm_min_interval_seconds", 0.0)) * journal_workers,
                     "max_image_bytes": int(cfg["generation"].get("max_image_bytes", 0)),
                     "max_image_side": int(cfg["generation"].get("max_image_side", 1600)),
                     "image_jpeg_quality": int(cfg["generation"].get("image_jpeg_quality", 85)),
@@ -584,14 +606,19 @@ def _build_vlm_pool(cfg: dict[str, Any]) -> VlmPool:
             }
         },
     )
+    _scale_provider_quota(cfg, journal_workers)
     return VlmPool.from_config(cfg, cfg["prompts"])
 
 
-def _process_journal(journal: Any, cfg: dict[str, Any]) -> dict[str, Any]:
+def _process_journal(journal: Any, cfg: dict[str, Any], vlm: VlmPool | None = None) -> dict[str, Any]:
     output_dir = Path(journal.output_dir)
     logger = configure_logger(f"{cfg['logger_name']}.{journal.journal_id}", cfg["runtime"].get("log_level"))
     state = RunState(logger)
-    vlm = None if bool(cfg["runtime"]["skip_vlm"]) else _build_vlm_pool(cfg)
+    if bool(cfg["runtime"]["skip_vlm"]):
+        vlm = None
+    elif vlm is None:
+        # 多进程路径：VlmPool 含线程锁不可 pickle，只能在子进程里现建。
+        vlm = _build_vlm_pool(cfg)
 
     logger.info("start journal_id=%s pdf=%s", journal.journal_id, journal.source_pdf)
     append_jsonl(output_dir / cfg["paths"]["manifest"], asdict(journal))
@@ -769,10 +796,12 @@ def run_pipeline(options: PipelineOptions | None = None) -> list[dict[str, Any]]
 
     if journal_workers == 1 or total <= 1:
         results = []
+        # 单进程时整批共用一个 pool，provider 的冷却和轮询状态才能跨 journal 延续。
+        shared_vlm = None if bool(cfg["runtime"]["skip_vlm"]) else _build_vlm_pool(cfg)
         with ProgressBar(total, desc="期刊", enabled=show_progress) as bar:
             for journal in journals:
                 bar.set_current(journal.journal_id)
-                result = _process_journal(journal, cfg)
+                result = _process_journal(journal, cfg, shared_vlm)
                 ok, label = _summarize(result)
                 bar.advance(ok=ok, current=label)
                 results.append(result)

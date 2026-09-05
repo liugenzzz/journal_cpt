@@ -61,6 +61,17 @@ python3 clean_watermarked_pdfs.py outputs/watermark_cleaned data/自由阻尼梁
 
 VLM provider 的 URL、model、并发和 fallback 策略与书籍侧保持一致。`journal_cpt/config.py` 会优先从同工作区的 `book_cpt.config` 继承匹配 provider 的 `api_key`；如果书籍配置不可用，则使用环境变量或无鉴权配置。
 
+## VLM 调度
+
+provider 之间是**抢占式**分配，不是先排名再指派：线程拿到任务后向所有可用 provider 逐个非阻塞试抢槽位，抢到哪个用哪个；全忙就等在条件变量上，谁先跑完释放槽位谁就接下一个任务。快的 provider 天然分到更多任务，不需要靠 `weight` 手动调。
+
+- 单个 provider 的在途请求数严格不超过它的 `max_concurrency`。
+- 某个 provider 失败时槽位立即归还，任务转投下一个 provider（受 `fallback.max_attempts` 限制）。
+- `--journal-workers > 1` 时 journal 级走多进程，`VlmPool` 含线程锁无法 pickle，只能每个子进程各建一份。因此 `max_concurrency` 会按进程数向下摊薄、`min_interval_seconds` 按进程数放大，保证 provider 实际承受的并发不超过配置声明值。
+- `--journal-workers 1`（默认）时整批共用一个 pool，provider 的冷却状态可以跨 journal 延续。
+
+已知限制：多进程下各子进程的冷却状态互不可见，一个 provider 挂掉后每个进程都要各自踩一次才会进入冷却。
+
 ## 思维链（think）处理
 
 除 MinerU 外的生成模型都是推理模型，默认会输出思维链，因此请求和响应两侧都做了处理：
