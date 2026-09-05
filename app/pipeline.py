@@ -18,7 +18,7 @@ from ..processing.crop import crop_blocks
 from ..processing.ingest import scan_input_journals, scan_journals
 from ..processing.normalize import normalize_pages
 from ..processing.render import render_pages
-from ..processing.watermark import clean_pdf_watermarks
+from ..processing.watermark import UnreadablePdfError, clean_pdf_watermarks
 from ..services.clients import VlmPool
 from ..services.mineru import mineru_cache_is_valid, parse_journal_with_mineru
 from ..tasks.dedup import deduplicate
@@ -801,6 +801,17 @@ def _process_journal(journal: Any, cfg: dict[str, Any], vlm: VlmPool | None = No
         result = {"journal_id": journal.journal_id, "output_dir": str(output_dir), "sample_count": len(deduped)}
         logger.info("completed journal_id=%s samples=%s", journal.journal_id, len(deduped))
         return result
+    except UnreadablePdfError as exc:
+        # 文件本身坏了，重试也没用，不算失败，直接跳过下一篇。
+        logger.warning("skip unreadable pdf journal_id=%s pdf=%s reason=%s", journal.journal_id, journal.source_pdf, exc)
+        return {
+            "journal_id": journal.journal_id,
+            "output_dir": str(output_dir),
+            "sample_count": 0,
+            "skipped": "unreadable_pdf",
+            "skip_reason": str(exc),
+            "source_pdf": str(journal.source_pdf),
+        }
     except Exception as exc:
         state.error({"stage": "journal", "journal_id": journal.journal_id, "error": str(exc)})
         logger.exception("failed journal_id=%s", journal.journal_id)
@@ -837,9 +848,26 @@ def run_pipeline(options: PipelineOptions | None = None) -> list[dict[str, Any]]
     def _summarize(result: dict[str, Any]) -> tuple[bool, str]:
         ok = not result.get("error")
         label = str(result.get("journal_id", ""))
-        if not ok:
+        if result.get("skipped"):
+            label = f"{label} 跳过"
+        elif not ok:
             label = f"{label} 失败"
         return ok, label
+
+    skip_log = output_root / str(cfg["paths"].get("skipped_journals", "skipped_journals.jsonl"))
+
+    def _record_skip(result: dict[str, Any]) -> None:
+        if not result.get("skipped"):
+            return
+        append_jsonl(
+            skip_log,
+            {
+                "journal_id": result.get("journal_id"),
+                "source_pdf": result.get("source_pdf"),
+                "skipped": result.get("skipped"),
+                "reason": result.get("skip_reason"),
+            },
+        )
 
     if journal_workers == 1 or total <= 1:
         results = []
@@ -849,6 +877,7 @@ def run_pipeline(options: PipelineOptions | None = None) -> list[dict[str, Any]]
             for journal in journals:
                 bar.set_current(journal.journal_id)
                 result = _process_journal(journal, cfg, shared_vlm)
+                _record_skip(result)
                 ok, label = _summarize(result)
                 bar.advance(ok=ok, current=label)
                 results.append(result)
@@ -870,6 +899,7 @@ def run_pipeline(options: PipelineOptions | None = None) -> list[dict[str, Any]]
                         "error": str(exc),
                     }
                 ordered_results[index] = result
+                _record_skip(result)
                 ok, label = _summarize(result)
                 bar.advance(ok=ok, current=label)
     return [result for result in ordered_results if result is not None]

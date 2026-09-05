@@ -111,10 +111,17 @@ def main() -> None:
             progress=args.progress,
         )
     )
-    ok = [item for item in results if not item.get("error")]
+    skipped = [item for item in results if item.get("skipped")]
     failed = [item for item in results if item.get("error")]
+    ok = [item for item in results if not item.get("error") and not item.get("skipped")]
     total_samples = sum(int(item.get("sample_count", 0)) for item in results)
     print(f"\n完成 {len(ok)}/{len(results)} 个 PDF，样本 {total_samples} 条", file=sys.stderr)
+    if skipped:
+        print(f"跳过 {len(skipped)} 个（文件损坏，已记入 skipped_journals.jsonl）:", file=sys.stderr)
+        for item in skipped[:10]:
+            print(f"  - {item.get('journal_id')}: {str(item.get('skip_reason'))[:120]}", file=sys.stderr)
+        if len(skipped) > 10:
+            print(f"  ... 另有 {len(skipped) - 10} 个", file=sys.stderr)
     if failed:
         print(f"失败 {len(failed)} 个:", file=sys.stderr)
         for item in failed[:20]:

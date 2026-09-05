@@ -83,6 +83,16 @@ provider 的**冷却状态跨进程共享**，落在 `output_root/.runtime/vlm_c
 
 加第二台只需把 `config.py` 里 `mineru.providers` 的 `mineru_2` 填上地址、`enabled` 改成 `True`。
 
+## 损坏 PDF 的处理
+
+pypdf 打不开的 PDF（截断、加密、结构损坏）会被**跳过**，不计入失败：
+
+- 水印清洗阶段抛 `UnreadablePdfError`，`_process_journal` 单独捕获，打一条 WARNING 后继续下一篇。
+- 跳过的文件记进 `<output-root>/skipped_journals.jsonl`，含 `journal_id`、`source_pdf` 和具体原因。
+- CLI 收尾会把「跳过」和「失败」分开统计，避免坏文件淹没真正需要排查的错误。
+
+注意 `processing/ingest.py` 的 `page_count()` 读页数时有 pypdf → PyMuPDF → 正则三级兜底，所以坏文件照样能被扫描进来，拦截点在水印清洗这一步。PyMuPDF 能读而 pypdf 读不了的文件目前也一并跳过。
+
 ## 思维链（think）处理
 
 除 MinerU 外的生成模型都是推理模型，默认会输出思维链，因此请求和响应两侧都做了处理：

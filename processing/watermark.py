@@ -8,6 +8,13 @@ from ..core.io_utils import file_sha256, write_json
 from ..core.models import JournalRecord
 
 
+class UnreadablePdfError(RuntimeError):
+    """PDF 本身损坏/截断，pypdf 打不开。
+
+    这类文件不是流水线的问题，也没有重试价值，由上层直接跳过而不是记成失败。
+    """
+
+
 @dataclass(frozen=True)
 class WatermarkCleanResult:
     source_pdf: str
@@ -184,7 +191,12 @@ def clean_pdf_watermarks(journal: JournalRecord, cfg: dict[str, Any]) -> Waterma
 
     from pypdf import PdfReader, PdfWriter  # type: ignore
 
-    reader = PdfReader(str(source_pdf))
+    try:
+        reader = PdfReader(str(source_pdf))
+    except Exception as exc:
+        # 截断、加密、结构损坏都会落到这里。ingest 那边读页数有 fitz/正则兜底，
+        # 所以坏文件照样能扫进来，必须在这里拦住并说清楚原因。
+        raise UnreadablePdfError(f"{type(exc).__name__}: {exc}") from exc
     candidate_names = _find_repeated_watermark_forms(reader, cfg)
     if not candidate_names:
         result = WatermarkCleanResult(

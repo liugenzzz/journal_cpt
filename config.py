@@ -116,6 +116,7 @@ CFG = {
     "logger_name": "journal_cpt",
     "statuses": {"ready": "ready", "done": "done"},
     "paths": {
+        "skipped_journals": "skipped_journals.jsonl",
         "manifest": "manifest.jsonl",
         "pages_manifest": "pages/page_index.jsonl",
         "articles_manifest": "articles/articles.jsonl",
