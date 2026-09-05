@@ -336,7 +336,7 @@ CFG = {
                 "temperature": 0.6,
                 "max_tokens": 131072,
                 "timeout": 2400,
-                "chat_template_kwargs": {},
+                "chat_template_kwargs": {"enable_thinking": False},
                 "capabilities": ["text", "image"],
                 "task_types": TASK_TYPES,
                 "weight": 3,

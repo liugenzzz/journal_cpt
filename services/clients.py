@@ -77,6 +77,35 @@ class MinerUClient(RequestsClient):
         return response.json()
 
 
+# 除 MinerU 外的推理模型（Qwen3 / DeepSeek-R1 系列等）默认会输出思维链。
+# 服务端开了 reasoning parser 时思维链落在 message.reasoning_content，content 是干净的；
+# 没开 parser 时 <think>...</think> 会原样留在 content 里，必须在解析 JSON 前剥掉。
+_REASONING_TAG = r"think|thinking|reasoning|reason"
+_REASONING_BLOCK_RE = re.compile(rf"<\s*({_REASONING_TAG})\s*>.*?<\s*/\s*\1\s*>", re.IGNORECASE | re.DOTALL)
+_REASONING_CLOSE_RE = re.compile(rf"^.*<\s*/\s*(?:{_REASONING_TAG})\s*>", re.IGNORECASE | re.DOTALL)
+_REASONING_OPEN_RE = re.compile(rf"<\s*(?:{_REASONING_TAG})\s*>", re.IGNORECASE)
+_REASONING_CONTENT_TYPES = {"thinking", "reasoning", "reasoning_content", "redacted_thinking"}
+
+# 关闭思考的默认 chat_template_kwargs；provider 可以显式覆盖具体字段，
+# 或整体设 disable_thinking=False 来保留思维链。
+DEFAULT_CHAT_TEMPLATE_KWARGS: dict[str, Any] = {"enable_thinking": False}
+
+
+def strip_reasoning(text: str) -> str:
+    """剥掉模型输出里的思维链，只保留最终回答。"""
+    if not text:
+        return ""
+    cleaned = _REASONING_BLOCK_RE.sub("", text)
+    # 只有闭合标签（思维链以前缀形式返回，或开标签被模板吃掉）：丢掉最后一个 </think> 之前的所有内容。
+    if _REASONING_CLOSE_RE.search(cleaned):
+        cleaned = _REASONING_CLOSE_RE.sub("", cleaned, count=1)
+    # 只有开标签（输出被 max_tokens 截断）：其后全是思维链，没有可用回答。
+    open_match = _REASONING_OPEN_RE.search(cleaned)
+    if open_match:
+        cleaned = cleaned[: open_match.start()]
+    return cleaned.strip()
+
+
 @dataclass(frozen=True)
 class VlmResponse:
     text: str
@@ -137,16 +166,44 @@ class VlmClient(RequestsClient):
                 time.sleep(delay)
             self._last_request_at = time.monotonic()
 
-    def _extract_message(self, payload: Any) -> str:
-        content = payload["choices"][0].get("message", {}).get("content", "")
+    @staticmethod
+    def _content_to_text(content: Any) -> str:
         if isinstance(content, str):
-            return content.strip()
+            return content
         if isinstance(content, list):
-            return "\n".join(str(item.get("text", "")) for item in content if isinstance(item, dict)).strip()
-        return str(content).strip()
+            parts: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("type") or "").lower() in _REASONING_CONTENT_TYPES:
+                    continue
+                parts.append(str(item.get("text", "")))
+            return "\n".join(parts)
+        if content is None:
+            return ""
+        return str(content)
+
+    def _finalize_text(self, content: Any, reasoning: Any) -> str:
+        text = strip_reasoning(self._content_to_text(content))
+        if text:
+            return text
+        if str(self._content_to_text(reasoning)).strip():
+            # 回答全部落在思维链里：通常是没关思考且被 max_tokens 截断。
+            raise RuntimeError(
+                f"VLM provider {self.name} returned only reasoning content and no answer "
+                "—— 确认 provider 的 chat_template_kwargs.enable_thinking=False，或调大 max_tokens"
+            )
+        return ""
+
+    def _extract_message(self, payload: Any) -> str:
+        message = payload["choices"][0].get("message", {})
+        if not isinstance(message, dict):
+            message = {}
+        return self._finalize_text(message.get("content", ""), message.get("reasoning_content"))
 
     def _extract_stream(self, response: Any) -> str:
         parts: list[str] = []
+        reasoning_parts: list[str] = []
         for line in response.iter_lines(decode_unicode=True):
             if not line:
                 continue
@@ -156,11 +213,26 @@ class VlmClient(RequestsClient):
             if not text or text == "[DONE]":
                 continue
             payload = maybe_json(text)
-            if isinstance(payload, dict):
-                choice = payload.get("choices", [{}])[0]
-                delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
-                parts.append(str(delta.get("content", "")) if isinstance(delta, dict) else "")
-        return "".join(parts).strip()
+            if not isinstance(payload, dict):
+                continue
+            choices = payload.get("choices") or [{}]
+            choice = choices[0] if isinstance(choices, list) and choices else {}
+            delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
+            if not isinstance(delta, dict):
+                continue
+            parts.append(self._content_to_text(delta.get("content", "")))
+            reasoning_parts.append(self._content_to_text(delta.get("reasoning_content", "")))
+        return self._finalize_text("".join(parts), "".join(reasoning_parts))
+
+    def _chat_template_kwargs(self) -> dict[str, Any]:
+        configured = self.cfg.get("chat_template_kwargs")
+        configured = dict(configured) if isinstance(configured, dict) else {}
+        if not bool(self.cfg.get("disable_thinking", True)):
+            return configured
+        # 显式配置优先，但缺省一律补上关闭思考的字段（空 dict 也要补）。
+        merged = dict(DEFAULT_CHAT_TEMPLATE_KWARGS)
+        merged.update(configured)
+        return merged
 
     def chat(self, prompt: str, images: list[Path] | None = None) -> str:
         content: str | list[dict[str, Any]]
@@ -181,8 +253,8 @@ class VlmClient(RequestsClient):
         }
         if self.cfg.get("max_tokens") is not None:
             payload["max_tokens"] = self.cfg["max_tokens"]
-        template_kwargs = self.cfg.get("chat_template_kwargs")
-        if isinstance(template_kwargs, dict) and template_kwargs:
+        template_kwargs = self._chat_template_kwargs()
+        if template_kwargs:
             payload["chat_template_kwargs"] = template_kwargs
         extra_payload = self.cfg.get("extra_payload")
         if isinstance(extra_payload, dict):
@@ -397,7 +469,7 @@ class VlmPool:
 
 
 def _strip_json_fence(text: str) -> str:
-    stripped = text.strip()
+    stripped = strip_reasoning(text)
     if not stripped.startswith("```"):
         return stripped
     lines = stripped.splitlines()
@@ -559,14 +631,20 @@ def parse_jsonl_objects(text: str) -> list[dict[str, Any]]:
             end = candidate.rfind("}")
             if start < 0 or end <= start:
                 continue
-            payload = json.loads(candidate[start : end + 1])
+            try:
+                payload = json.loads(candidate[start : end + 1])
+            except json.JSONDecodeError:
+                continue
         if isinstance(payload, dict):
             rows.append(payload)
 
     if rows:
         return rows
 
-    payload = json.loads(stripped)
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"VLM response is not valid JSONL/JSON: {exc}") from exc
     if isinstance(payload, dict):
         return [payload]
     raise ValueError("VLM response must be JSONL objects, a JSON object, or a JSON array.")

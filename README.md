@@ -61,6 +61,16 @@ python3 clean_watermarked_pdfs.py outputs/watermark_cleaned data/自由阻尼梁
 
 VLM provider 的 URL、model、并发和 fallback 策略与书籍侧保持一致。`journal_cpt/config.py` 会优先从同工作区的 `book_cpt.config` 继承匹配 provider 的 `api_key`；如果书籍配置不可用，则使用环境变量或无鉴权配置。
 
+## 思维链（think）处理
+
+除 MinerU 外的生成模型都是推理模型，默认会输出思维链，因此请求和响应两侧都做了处理：
+
+- **请求侧**：`VlmClient` 会给每个 provider 的 `chat_template_kwargs` 补上 `enable_thinking: False`，provider 里显式写的字段优先。provider 配置成空 dict 或不写该字段也同样生效；确需保留思维链时在 provider 上设 `disable_thinking: False`。
+- **响应侧**：只取 `message.content`（或流式的 `delta.content`），忽略 `reasoning_content` 和 list content 里 `type` 为 thinking/reasoning 的分片。
+- **解析侧**：解析 JSON 前统一调用 `strip_reasoning()`，剥掉成对的 `<think>...</think>`、只有闭合标签的前缀式思维链，以及被 `max_tokens` 截断后只剩开标签的输出。这样思维链里出现 `[` 或 `{` 时，不会再让 `parse_json_array` / `parse_jsonl_objects` 从错误的位置开始解析。
+
+如果服务端返回的内容全部落在 `reasoning_content` 里而 `content` 为空（通常是没关思考且被 `max_tokens` 截断），会抛出带排查提示的 `RuntimeError`，由 provider pool 走 fallback。
+
 ## 图表上下文绑定
 
 `figure_table_formula_to_text` 不使用整页随意邻近文本作为图文上下文。路由时会为每个目标图、表或公式绑定：
