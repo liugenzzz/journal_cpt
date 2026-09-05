@@ -1,0 +1,5 @@
+# journal_cpt 运行依赖
+requests>=2.28        # 调 MinerU / VLM 接口，缺了直接报错
+pypdf>=4.0            # PDF 页数统计、水印清理
+PyMuPDF>=1.24         # 页面渲染成图（render_pages），缺了会静默跳过
+Pillow>=10.0          # 图像归一化、裁剪、质量检测、base64 编码

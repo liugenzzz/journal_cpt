@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+env/
+ENV/
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 环境变量
+.env
+.env.*
+!.env.example
+
+# 日志
+logs/
+log/
+*.log
+*.out
+
+# 训练输出
+runs/
+output/
+outputs/
+results/
+tmp/
+temp/
+data/
+output/
+outputs/
