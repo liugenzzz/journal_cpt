@@ -557,10 +557,42 @@ def _strip_json_fence(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _extract_balanced(text: str, opener: str, closer: str) -> str | None:
+    start = text.find(opener)
+    if start < 0:
+        return None
+    in_string = False
+    escaped = False
+    depth = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and in_string:
+            escaped = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == opener:
+            depth += 1
+        elif char == closer:
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return text[start:]
+
+
 def _extract_json_array(text: str) -> str:
     start = text.find("[")
     if start < 0:
-        return text
+        # 只生成一条样本时，模型常常直接返回对象而不是单元素数组；
+        # 把对象本体切出来，免得前后的说明文字把解析带偏。
+        extracted = _extract_balanced(text, "{", "}")
+        return extracted if extracted is not None else text
     in_string = False
     escaped = False
     depth = 0
@@ -695,8 +727,13 @@ def _loads_json_array(text: str) -> Any:
 def parse_json_array(text: str) -> list[dict[str, Any]]:
     stripped = _strip_json_fence(text)
     payload = _loads_json_array(stripped)
+    if isinstance(payload, dict):
+        # expected_count 为 1 时模型经常返回 {...} 而不是 [{...}]，
+        # 内容是对的，没必要整条丢掉。
+        return [payload]
     if not isinstance(payload, list):
-        raise ValueError("VLM response must be a JSON array.")
+        preview = stripped[:200].replace("\n", "\\n")
+        raise ValueError(f"VLM response must be a JSON array or object, got {type(payload).__name__} | 响应开头: {preview!r}")
     return [item for item in payload if isinstance(item, dict)]
 
 

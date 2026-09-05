@@ -114,3 +114,36 @@ class PromptBudgetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SingleObjectResponseTests(unittest.TestCase):
+    """expected_count=1 时模型常返回 {...} 而不是 [{...}]，内容是对的，不该整条丢掉。"""
+
+    def test_bare_object_is_wrapped(self) -> None:
+        rows = parse_json_array('{"instruction": "q", "answer": "a"}')
+        self.assertEqual(rows, [{"instruction": "q", "answer": "a"}])
+
+    def test_object_with_surrounding_prose_is_extracted(self) -> None:
+        raw = '好的，这是生成的样本：\n{"instruction": "q", "answer": "a"}\n以上。'
+        self.assertEqual(parse_json_array(raw), [{"instruction": "q", "answer": "a"}])
+
+    def test_object_with_inner_quotes_and_newlines(self) -> None:
+        raw = '{\n  "instruction": "小节标题 "4.1 舵叶干扰模式" 是否完整？",\n  "answer": "第一行。\n第二行。"\n}'
+        rows = parse_json_array(raw)
+        self.assertEqual(len(rows), 1)
+        self.assertIn("4.1 舵叶干扰模式", rows[0]["instruction"])
+        self.assertIn("\n", rows[0]["answer"])
+
+    def test_nested_braces_inside_object_are_balanced(self) -> None:
+        raw = '{"instruction": "q", "evidence": {"block_id": "p1_b2"}, "answer": "a"}'
+        rows = parse_json_array(raw)
+        self.assertEqual(rows[0]["evidence"], {"block_id": "p1_b2"})
+
+    def test_array_response_still_wins_over_object(self) -> None:
+        raw = '[{"instruction": "q1", "answer": "a1"}, {"instruction": "q2", "answer": "a2"}]'
+        self.assertEqual(len(parse_json_array(raw)), 2)
+
+    def test_scalar_response_still_raises_with_preview(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            parse_json_array("123")
+        self.assertIn("响应开头", str(ctx.exception))
