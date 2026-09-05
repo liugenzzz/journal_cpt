@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .clients import MinerUClient
+from .cooldown import SharedCooldown, runtime_dir
 from ..core.io_utils import clean_text, maybe_json, read_json, stable_json_hash, write_json
 from ..core.models import JournalRecord
 
@@ -320,38 +321,144 @@ def mineru_cache_is_valid(journal: JournalRecord, cfg: dict[str, Any]) -> bool:
     return bool(status["valid"])
 
 
+@dataclass(frozen=True)
+class MinerUProvider:
+    name: str
+    cfg: dict[str, Any]
+    max_concurrency: int
+    weight: int
+
+    @property
+    def url(self) -> str:
+        return str(self.cfg.get("url") or "")
+
+
+def mineru_providers(cfg: dict[str, Any]) -> list[MinerUProvider]:
+    """把 mineru 配置摊成 provider 列表。
+
+    没配 providers 时退回单实例，行为与改造前一致。
+    provider 条目继承 mineru 顶层的通用配置（parse_method / timeout / 阈值等），
+    只覆盖 url、server_url、max_concurrency 这类实例相关的字段。
+    """
+    mineru_cfg = dict(cfg.get("mineru", {}))
+    raw_providers = mineru_cfg.pop("providers", None)
+    if not isinstance(raw_providers, list) or not raw_providers:
+        raw_providers = [{}]
+    providers: list[MinerUProvider] = []
+    for index, entry in enumerate(raw_providers, start=1):
+        if not isinstance(entry, dict) or entry.get("enabled") is False:
+            continue
+        provider_cfg = dict(mineru_cfg)
+        provider_cfg.update(entry)
+        name = str(provider_cfg.get("name") or f"mineru_{index}")
+        provider_cfg["name"] = name
+        providers.append(
+            MinerUProvider(
+                name=name,
+                cfg=provider_cfg,
+                max_concurrency=max(1, int(provider_cfg.get("max_concurrency", 1))),
+                weight=max(1, int(provider_cfg.get("weight", 1))),
+            )
+        )
+    if not providers:
+        raise RuntimeError("No enabled MinerU provider is configured.")
+    missing = [provider.name for provider in providers if not provider.url]
+    if missing:
+        raise RuntimeError(f"MinerU provider(s) without url: {', '.join(missing)}")
+    return providers
+
+
+def _mineru_slot_dir(cfg: dict[str, Any], journal: JournalRecord) -> Path:
+    directory = runtime_dir(cfg, "mineru_slots", fallback=Path(journal.output_dir).parent)
+    assert directory is not None
+    return directory
+
+
+def _reap_stale_slot(candidate: Path, stale_seconds: float, now: float) -> None:
+    if not stale_seconds:
+        return
+    try:
+        if candidate.exists() and now - candidate.stat().st_mtime > stale_seconds:
+            candidate.unlink()
+    except OSError:
+        pass
+
+
+def _try_take_slot(slot_dir: Path, provider: MinerUProvider, journal: JournalRecord, stale_seconds: float, now: float) -> Path | None:
+    provider_dir = slot_dir / provider.name
+    provider_dir.mkdir(parents=True, exist_ok=True)
+    for index in range(provider.max_concurrency):
+        candidate = provider_dir / f"slot_{index}.lock"
+        _reap_stale_slot(candidate, stale_seconds, now)
+        try:
+            fd = os.open(str(candidate), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f"pid={os.getpid()}\njournal_id={journal.journal_id}\ncreated_at={now}\n")
+        return candidate
+    return None
+
+
+def _free_slot_count(slot_dir: Path, provider: MinerUProvider) -> int:
+    provider_dir = slot_dir / provider.name
+    taken = 0
+    for index in range(provider.max_concurrency):
+        if (provider_dir / f"slot_{index}.lock").exists():
+            taken += 1
+    return provider.max_concurrency - taken
+
+
 @contextmanager
-def _mineru_slot(journal: JournalRecord, cfg: dict[str, Any]):
+def _mineru_slot(
+    journal: JournalRecord,
+    cfg: dict[str, Any],
+    providers: list[MinerUProvider] | None = None,
+    exclude: set[str] | None = None,
+):
+    """抢占式拿一个 MinerU 实例的槽位；谁先空谁被拿走。
+
+    槽位是文件锁，天然跨进程（甚至跨主机，只要 output_root 是共享盘），
+    所以这里的并发上限对整批任务都成立，不像 VLM 那边的信号量只在进程内有效。
+    """
     mineru_cfg = cfg.get("mineru", {})
-    max_concurrency = max(1, int(mineru_cfg.get("max_concurrency", 1)))
     poll_seconds = max(0.1, float(mineru_cfg.get("slot_poll_seconds", 2)))
     stale_seconds = max(0.0, float(mineru_cfg.get("slot_stale_seconds", 7200)))
-    output_root = Path(cfg.get("runtime", {}).get("output_root") or Path(journal.output_dir).parent)
-    slot_dir = output_root / ".runtime" / "mineru_slots"
+    all_providers = providers if providers is not None else mineru_providers(cfg)
+    excluded = exclude or set()
+    usable = [provider for provider in all_providers if provider.name not in excluded] or all_providers
+    shared_cooldown = SharedCooldown(
+        runtime_dir(cfg, "mineru_cooldown", fallback=Path(journal.output_dir).parent),
+        ttl_seconds=float(cfg.get("runtime", {}).get("cooldown_refresh_seconds", 1.0)),
+    )
+    slot_dir = _mineru_slot_dir(cfg, journal)
     slot_dir.mkdir(parents=True, exist_ok=True)
+
     slot_path: Path | None = None
+    taken: MinerUProvider | None = None
     try:
         while slot_path is None:
             now = time.time()
-            for index in range(max_concurrency):
-                candidate = slot_dir / f"slot_{index}.lock"
-                if stale_seconds and candidate.exists():
-                    try:
-                        if now - candidate.stat().st_mtime > stale_seconds:
-                            candidate.unlink()
-                    except OSError:
-                        pass
-                try:
-                    fd = os.open(str(candidate), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                except FileExistsError:
-                    continue
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    handle.write(f"pid={os.getpid()}\njournal_id={journal.journal_id}\ncreated_at={now}\n")
-                slot_path = candidate
-                break
+            ranked = [provider for provider in usable if not shared_cooldown.cooling_down(provider.name)] or usable
+            # 空槽最多的排前面；同样空闲时按 weight 倾斜。起点用 pid 打散，
+            # 避免多个进程每轮都从同一个 provider 开始抢。
+            offset = os.getpid()
+            ranked = sorted(
+                enumerate(ranked),
+                key=lambda item: (
+                    -_free_slot_count(slot_dir, item[1]) / item[1].max_concurrency,
+                    -item[1].weight,
+                    (item[0] + offset) % max(1, len(ranked)),
+                ),
+            )
+            for _, provider in ranked:
+                candidate = _try_take_slot(slot_dir, provider, journal, stale_seconds, now)
+                if candidate is not None:
+                    slot_path, taken = candidate, provider
+                    break
             if slot_path is None:
                 time.sleep(poll_seconds)
-        yield
+        yield taken
     finally:
         if slot_path is not None:
             try:
@@ -397,15 +504,26 @@ def parse_journal_with_mineru(journal: JournalRecord, cfg: dict[str, Any]) -> Mi
             write_json(status_path, failed_status)
 
     attempts = max(1, int(cfg.get("mineru", {}).get("retry_count", 0)) + 1)
+    providers = mineru_providers(cfg)
+    cooldown_seconds = max(0.0, float(cfg.get("mineru", {}).get("cooldown_seconds", 300.0)))
+    shared_cooldown = SharedCooldown(
+        runtime_dir(cfg, "mineru_cooldown", fallback=Path(journal.output_dir).parent),
+        ttl_seconds=float(cfg.get("runtime", {}).get("cooldown_refresh_seconds", 1.0)),
+    )
     last_error: Exception | None = None
+    tried: set[str] = set()
     for attempt in range(1, attempts + 1):
+        provider: MinerUProvider | None = None
         try:
-            with _mineru_slot(journal, cfg):
-                payload = MinerUClient(cfg["mineru"]).parse_pdf(Path(journal.source_pdf))
+            with _mineru_slot(journal, cfg, providers, exclude=tried) as provider:
+                tried.add(provider.name)
+                payload = MinerUClient(provider.cfg).parse_pdf(Path(journal.source_pdf))
+            shared_cooldown.clear(provider.name)
             content = find_content_list(payload)
-            status = _validate_mineru_result(journal, content, {}, cfg, f"mineru_attempt_{attempt}")
+            source = f"mineru_attempt_{attempt}_{provider.name}"
+            status = _validate_mineru_result(journal, content, {}, cfg, source)
             image_map = save_extracted_images(payload, content, output_dir, cfg)
-            status = _build_mineru_status(journal, content, image_map, cfg, f"mineru_attempt_{attempt}")
+            status = _build_mineru_status(journal, content, image_map, cfg, source)
             write_json(raw_path, strip_embedded_images(payload))
             write_json(parsed_path, content)
             write_json(image_map_path, image_map)
@@ -421,7 +539,15 @@ def parse_journal_with_mineru(journal: JournalRecord, cfg: dict[str, Any]) -> Mi
             )
         except Exception as exc:
             last_error = exc
-            failed_status = _build_mineru_status(journal, [], {}, cfg, f"mineru_attempt_{attempt}", str(exc))
+            provider_name = provider.name if provider is not None else "unknown"
+            # 只有实例本身不可用才拉黑；解析结果不完整是这份 PDF 的问题，换实例也一样。
+            if provider is not None and not isinstance(exc, MinerUParseIncompleteError):
+                shared_cooldown.mark(provider_name, cooldown_seconds)
+            if len(tried) >= len(providers):
+                tried.clear()
+            failed_status = _build_mineru_status(
+                journal, [], {}, cfg, f"mineru_attempt_{attempt}_{provider_name}", str(exc)
+            )
             try:
                 write_json(status_path, failed_status)
             except Exception:

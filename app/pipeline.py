@@ -77,6 +77,11 @@ def _apply_options(cfg: dict[str, Any], options: PipelineOptions) -> dict[str, A
     if options.min_block_text_chars is not None:
         override.setdefault("routing", {})["min_block_text_chars"] = int(options.min_block_text_chars)
     cfg = deep_merge(cfg, override)
+    if options.mineru_workers is not None:
+        # providers 里的 max_concurrency 会盖掉 mineru 顶层默认值，命令行必须逐个写进去。
+        for provider in cfg.get("mineru", {}).get("providers") or []:
+            if isinstance(provider, dict):
+                provider["max_concurrency"] = int(options.mineru_workers)
     if bool(cfg["runtime"].get("force_rebuild")):
         cfg["runtime"]["reuse_mineru"] = False
         cfg["runtime"]["reuse_normalized"] = False

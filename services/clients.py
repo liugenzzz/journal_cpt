@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 from ..core.io_utils import maybe_json
+from .cooldown import SharedCooldown, runtime_dir
 
 
 class RequestsClient:
@@ -296,9 +297,10 @@ class VlmClient(RequestsClient):
 
 
 class _PooledVlmClient:
-    def __init__(self, client: VlmClient, cfg: dict[str, Any]) -> None:
+    def __init__(self, client: VlmClient, cfg: dict[str, Any], shared_cooldown: SharedCooldown | None = None) -> None:
         self.client = client
         self.cfg = cfg
+        self.shared_cooldown = shared_cooldown
         self.name = client.name
         self.model = str(cfg.get("model") or "")
         self.weight = max(1, int(cfg.get("weight") or 1))
@@ -316,18 +318,28 @@ class _PooledVlmClient:
             return self._active
 
     def is_cooling_down(self, now: float) -> bool:
+        """now 是进程内的 monotonic 时钟；共享状态自己用 wall clock 判断。"""
         with self._lock:
-            return self._cooldown_until > now
+            if self._cooldown_until > now:
+                return True
+        if self.shared_cooldown is not None:
+            return self.shared_cooldown.cooling_down(self.name)
+        return False
 
     def mark_failure(self, cooldown_seconds: float, now: float) -> None:
         if cooldown_seconds <= 0:
             return
         with self._lock:
             self._cooldown_until = max(self._cooldown_until, now + cooldown_seconds)
+        if self.shared_cooldown is not None:
+            # 立即落盘，别的 journal 进程下次调度就能看到，不用各自再踩一次。
+            self.shared_cooldown.mark(self.name, cooldown_seconds)
 
     def mark_success(self) -> None:
         with self._lock:
             self._cooldown_until = 0.0
+        if self.shared_cooldown is not None:
+            self.shared_cooldown.clear(self.name)
 
     @property
     def free_slots(self) -> int:
@@ -401,6 +413,11 @@ class VlmPool:
 
     @classmethod
     def from_config(cls, cfg: dict[str, Any], prompts: dict[str, str]) -> "VlmPool":
+        cooldown_dir = runtime_dir(cfg, "vlm_cooldown")
+        shared_cooldown = SharedCooldown(
+            cooldown_dir,
+            ttl_seconds=float(cfg.get("runtime", {}).get("cooldown_refresh_seconds", 1.0)),
+        )
         pool_cfg = cfg.get("vlm_pool")
         fallback_cfg: dict[str, Any] = {}
         provider_defaults: dict[str, Any] = {}
@@ -433,7 +450,7 @@ class VlmPool:
             provider_cfg.setdefault("name", f"vlm_{index}")
             provider_cfg.setdefault("capabilities", ["text", "image"])
             provider_cfg.setdefault("task_types", [])
-            clients.append(_PooledVlmClient(VlmClient(provider_cfg, prompts), provider_cfg))
+            clients.append(_PooledVlmClient(VlmClient(provider_cfg, prompts), provider_cfg, shared_cooldown))
 
         return cls(
             clients,

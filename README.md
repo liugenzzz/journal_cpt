@@ -68,9 +68,20 @@ provider 之间是**抢占式**分配，不是先排名再指派：线程拿到�
 - 单个 provider 的在途请求数严格不超过它的 `max_concurrency`。
 - 某个 provider 失败时槽位立即归还，任务转投下一个 provider（受 `fallback.max_attempts` 限制）。
 - `--journal-workers > 1` 时 journal 级走多进程，`VlmPool` 含线程锁无法 pickle，只能每个子进程各建一份。因此 `max_concurrency` 会按进程数向下摊薄、`min_interval_seconds` 按进程数放大，保证 provider 实际承受的并发不超过配置声明值。
-- `--journal-workers 1`（默认）时整批共用一个 pool，provider 的冷却状态可以跨 journal 延续。
+- `--journal-workers 1`（默认）时整批共用一个 pool。
 
-已知限制：多进程下各子进程的冷却状态互不可见，一个 provider 挂掉后每个进程都要各自踩一次才会进入冷却。
+provider 的**冷却状态跨进程共享**，落在 `output_root/.runtime/vlm_cooldown/<provider>.cooldown`。一个 provider 挂掉后所有 journal 进程都会跳过它，不用各自再踩一次。冷却是低频写、高频读，所以写立即落盘、读带 `runtime.cooldown_refresh_seconds`（默认 1 秒）的内存缓存；时间戳用 wall clock，因为 `time.monotonic()` 跨进程不可比。
+
+## MinerU 实例池
+
+`mineru.providers` 可以配多台 MinerU。槽位是 `output_root/.runtime/mineru_slots/<provider>/slot_N.lock` 文件锁，**跨进程乃至跨主机**（只要 `output_root` 是共享盘）都成立，因此并发上限对整批任务都有效，不像 VLM 侧的信号量只在进程内。
+
+- 分配同样是抢占式：按空闲槽位比例排序，谁先空谁被拿走；起点按 pid 打散，避免多个进程每轮都从同一台开始抢。
+- 单次解析失败会把该实例写进 `output_root/.runtime/mineru_cooldown/`，重试自动转到另一台。解析结果不完整（`MinerUParseIncompleteError`）不算实例故障——换台也一样，不会拉黑。
+- `--mineru-workers` 会写进每个 provider 的 `max_concurrency`。
+- 删掉 `providers` 则退回读 `mineru` 顶层的 `url`/`server_url`，即旧式单实例配置。
+
+加第二台只需把 `config.py` 里 `mineru.providers` 的 `mineru_2` 填上地址、`enabled` 改成 `True`。
 
 ## 思维链（think）处理
 

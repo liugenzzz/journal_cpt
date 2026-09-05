@@ -217,6 +217,7 @@ CFG = {
         "crop_workers": 4,
         "vlm_max_pending": 8,
         "vlm_min_interval_seconds": 0.0,
+        "cooldown_refresh_seconds": 1.0,
         "generation_state_flush_every": 20,
         "generation_state_flush_seconds": 10.0,
         "reuse_mineru": False,
@@ -253,9 +254,9 @@ CFG = {
         "skip_text_patterns": [r"^\s*\d+\s*$", r"^\s*第?\s*\d+\s*页\s*$"],
     },
     "mineru": {
-        "url": "http://10.107.226.27:8000",
+        # 下面这些是所有 MinerU 实例共用的默认值；providers 里的条目只覆盖
+        # url / server_url / max_concurrency 这类实例相关字段。
         "backend": "vlm-http-client",
-        "server_url": "http://10.107.226.27:30000",
         "parse_method": "auto",
         "lang_list": ["ch"],
         "timeout": 3600,
@@ -273,9 +274,31 @@ CFG = {
         "retry_count": 3,
         "retry_backoff_seconds": 5,
         "retry_backoff_multiplier": 2,
+        "cooldown_seconds": 300,
         "min_content_items": 1,
         "min_page_coverage": 0.75,
         "min_text_chars": 20,
+        # MinerU 实例池。槽位是 output_root/.runtime/mineru_slots/<name>/ 下的文件锁，
+        # 跨进程（乃至跨主机共享盘）都成立，谁先空谁被拿走。
+        # 删掉 providers 会退回读 mineru 顶层的 url/server_url（旧式单实例配置）。
+        "providers": [
+            {
+                "name": "mineru_1",
+                "url": "http://10.107.226.27:8000",
+                "server_url": "http://10.107.226.27:30000",
+                "max_concurrency": 16,
+                "weight": 1,
+            },
+            # 第二台 MinerU：把 url / server_url 换成实际地址，再把 enabled 改成 True。
+            {
+                "name": "mineru_2",
+                "enabled": False,
+                "url": "http://请填写第二台地址:8000",
+                "server_url": "http://请填写第二台地址:30000",
+                "max_concurrency": 16,
+                "weight": 1,
+            },
+        ],
     },
     "vlm_pool": {
         "strategy": "least_busy_weighted_fallback",
