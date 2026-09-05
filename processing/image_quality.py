@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -108,15 +109,60 @@ def is_complete_text_crop(image: Any, cfg: dict[str, Any]) -> bool:
     return edge_ink / edge_pixels <= max_edge_ink_ratio
 
 
-def is_meaningful_image_file(path: Path, cfg: dict[str, Any]) -> bool:
-    if not crop_filter_enabled(cfg):
-        return path.exists()
-    if not path.exists() or not path.is_file():
-        return False
+def _quality_signature(cfg: dict[str, Any]) -> tuple[Any, ...]:
+    """判定结果只取决于这几个配置项，用它们做缓存键的一部分。"""
+    crop_cfg = _filter_cfg(cfg)
+    return (
+        int(crop_cfg.get("min_width", 1)),
+        int(crop_cfg.get("min_height", 1)),
+        int(crop_cfg.get("min_area", 1)),
+        int(crop_cfg.get("white_pixel_threshold", 245)),
+        float(crop_cfg.get("max_blank_ratio", 0.985)),
+        float(crop_cfg.get("min_non_white_ratio", 0.005)),
+        float(crop_cfg.get("min_intensity_stddev", 3.0)),
+    )
+
+
+@lru_cache(maxsize=8192)
+def _meaningful_image_file_cached(path_str: str, mtime_ns: int, size: int, cfg_ref: "_CfgRef") -> bool:
     try:
         from PIL import Image  # type: ignore
 
-        with Image.open(path) as image:
-            return is_meaningful_image(image, cfg)
+        with Image.open(path_str) as image:
+            return is_meaningful_image(image, cfg_ref.cfg)
     except Exception:
         return False
+
+
+class _CfgRef:
+    """让 cfg 能进 lru_cache 的键：相等性只看 signature，实际读的还是原 cfg。"""
+
+    __slots__ = ("cfg", "signature")
+
+    def __init__(self, cfg: dict[str, Any]) -> None:
+        self.cfg = cfg
+        self.signature = _quality_signature(cfg)
+
+    def __hash__(self) -> int:
+        return hash(self.signature)
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, _CfgRef) and self.signature == other.signature
+
+
+def is_meaningful_image_file(path: Path, cfg: dict[str, Any]) -> bool:
+    """按 (路径, mtime, 大小, 判定参数) 缓存。
+
+    同一张页面图会被多个任务的多个样本反复送进校验，每次都是
+    open + convert("L") + histogram + stddev 三趟全量扫描；180dpi 整页图约 390 万像素。
+    mtime 和大小进键，--force-rebuild 重新生成图片后不会命中旧结果。
+    """
+    if not crop_filter_enabled(cfg):
+        return path.exists()
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    if not path.is_file():
+        return False
+    return _meaningful_image_file_cached(str(path), stat.st_mtime_ns, stat.st_size, _CfgRef(cfg))

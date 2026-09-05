@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, TextIO
 
 
 def utc_now(fmt: str) -> str:
@@ -39,9 +41,33 @@ def stable_json_hash(payload: Any) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def write_json(path: Path, payload: Any) -> None:
+def atomic_write_text(path: Path, write_body: Callable[[TextIO], None]) -> None:
+    """先写同目录临时文件再 os.replace 换上去。
+
+    直接 write_text 是"先截断再写"，进程在中间被杀（Ctrl-C、OOM、断电）会留下半截
+    文件。断点续跑的 checkpoint、normalized 页面、MinerU 缓存都靠这些文件，
+    写坏了会被当成"没有缓存"从头重跑，而崩溃恰恰是它们唯一要覆盖的场景。
+    os.replace 在 POSIX 和 Windows 上都是原子替换。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            write_body(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def write_json(path: Path, payload: Any) -> None:
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    atomic_write_text(path, lambda handle: handle.write(text))
 
 
 def read_json(path: Path) -> Any:
@@ -55,10 +81,11 @@ def append_jsonl(path: Path, payload: Any) -> None:
 
 
 def write_jsonl(path: Path, rows: Iterable[Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
+    def _body(handle: TextIO) -> None:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    atomic_write_text(path, _body)
 
 
 def iter_jsonl(path: Path) -> Iterable[Any]:

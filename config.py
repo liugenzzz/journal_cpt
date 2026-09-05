@@ -217,6 +217,8 @@ CFG = {
         "crop_workers": 4,
         "vlm_max_pending": 8,
         "vlm_min_interval_seconds": 0.0,
+        "generation_state_flush_every": 20,
+        "generation_state_flush_seconds": 10.0,
         "reuse_mineru": False,
         "reuse_normalized": True,
         "reuse_samples": True,

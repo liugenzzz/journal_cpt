@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from copy import deepcopy
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
 from dataclasses import asdict, replace
@@ -183,15 +185,25 @@ def _sample_resume_key(sample: dict[str, Any], cfg: dict[str, Any]) -> str:
     )
 
 
+def _state_logger(cfg: dict[str, Any]) -> logging.Logger:
+    return logging.getLogger(str(cfg.get("logger_name") or __name__))
+
+
 def _read_generation_state(output_dir: Path, cfg: dict[str, Any]) -> dict[str, Any]:
     path = _generation_state_path(output_dir, cfg)
     if not path.exists():
         return {}
     try:
         payload = read_json(path)
-    except Exception:
+    except Exception as exc:
+        # 读不动就等于"没有断点"，整批样本会重新生成。必须说出来，
+        # 否则用户只会看到莫名其妙的全量重跑。
+        _state_logger(cfg).warning("generation checkpoint unreadable, regenerating from scratch path=%s error=%s", path, exc)
         return {}
-    return payload if isinstance(payload, dict) else {}
+    if not isinstance(payload, dict):
+        _state_logger(cfg).warning("generation checkpoint is not an object, regenerating from scratch path=%s", path)
+        return {}
+    return payload
 
 
 def _generation_state_matches(payload: dict[str, Any], cfg: dict[str, Any], mineru_content_hash: str) -> bool:
@@ -309,7 +321,30 @@ def _generate_samples_for_jobs(
             return sample_count == 0 or raw_count >= sample_count
         return raw_count > 0
 
+    flush_every = max(1, int(cfg["runtime"].get("generation_state_flush_every", 20)))
+    flush_seconds = max(0.0, float(cfg["runtime"].get("generation_state_flush_seconds", 10.0)))
+    unflushed = 0
+    last_flush_at = time.monotonic()
+
+    def flush_generation_state(force: bool = False) -> None:
+        """攒批落盘。
+
+        原来每完成一个 job 就整份重写一次 checkpoint，n 个 job 要序列化 n²/2 个条目，
+        而且把"崩在写文件中间"的窗口放到最大。丢掉最后几条 checkpoint 是安全的：
+        样本本身已经追加进 samples/raw，sample_count_is_resumable 在没有 checkpoint
+        条目时会退回按 raw 行数判断，只有"产出 0 条样本"的 job 会被重跑。
+        """
+        nonlocal unflushed, last_flush_at
+        if not mineru_content_hash or unflushed == 0:
+            return
+        if not force and unflushed < flush_every and time.monotonic() - last_flush_at < flush_seconds:
+            return
+        _write_generation_state(output_dir, cfg, mineru_content_hash, completed_jobs)
+        unflushed = 0
+        last_flush_at = time.monotonic()
+
     def mark_job_completed(job: Any, job_key: str, samples: list[dict[str, Any]]) -> None:
+        nonlocal unflushed
         if not mineru_content_hash:
             return
         completed_jobs[job_key] = {
@@ -317,7 +352,8 @@ def _generate_samples_for_jobs(
             "journal_id": str(getattr(getattr(job, "journal", None), "journal_id", "")),
             "sample_count": len(samples),
         }
-        _write_generation_state(output_dir, cfg, mineru_content_hash, completed_jobs)
+        unflushed += 1
+        flush_generation_state()
 
     def ordered_raw_samples() -> list[dict[str, Any]]:
         ordered_rows = sorted(raw_sample_rows, key=lambda item: (item[0], item[1]))
@@ -369,6 +405,7 @@ def _generate_samples_for_jobs(
                 mark_job_completed(job, job_key, samples)
             except Exception as exc:
                 record_failure(job, exc)
+        flush_generation_state(force=True)
         raise_if_all_failed()
         return ordered_raw_samples()
 
@@ -399,6 +436,7 @@ def _generate_samples_for_jobs(
                     continue
                 add_samples(job_index, samples)
                 mark_job_completed(job, job_key, samples)
+    flush_generation_state(force=True)
     raise_if_all_failed()
     return ordered_raw_samples()
 
@@ -448,9 +486,13 @@ def _read_sample_cache_state(output_dir: Path, cfg: dict[str, Any]) -> dict[str,
         return {}
     try:
         payload = read_json(path)
-    except Exception:
+    except Exception as exc:
+        _state_logger(cfg).warning("sample cache state unreadable, treating as absent path=%s error=%s", path, exc)
         return {}
-    return payload if isinstance(payload, dict) else {}
+    if not isinstance(payload, dict):
+        _state_logger(cfg).warning("sample cache state is not an object, treating as absent path=%s", path)
+        return {}
+    return payload
 
 
 def _cached_completed_task_types(output_dir: Path, cfg: dict[str, Any], mineru_content_hash: str) -> set[str]:
