@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -20,6 +21,10 @@ class ProgressBar:
 
     非 TTY（重定向到文件、nohup）时自动退化成每次一行的纯文本进度，
     不会往日志里塞一堆回车符。
+
+    只有创建它的进程能渲染。journal 级用 ProcessPoolExecutor，Linux 上默认 fork，
+    子进程会连 ProgressBar.active 一起继承一份 done=0 的副本；子进程每打一条日志，
+    日志 handler 就会拿那份副本重绘，把父进程的真实计数覆盖成 0/N。
     """
 
     active: "ProgressBar | None" = None
@@ -37,6 +42,10 @@ class ProgressBar:
         self.enabled = bool(enabled) and self.total > 0
         self.is_tty = bool(getattr(sys.stderr, "isatty", lambda: False)())
         self._last_len = 0
+        self._owner_pid = os.getpid()
+
+    def _is_owner(self) -> bool:
+        return os.getpid() == self._owner_pid
 
     def __enter__(self) -> "ProgressBar":
         if self.enabled:
@@ -57,18 +66,18 @@ class ProgressBar:
 
     # ---- 供 logging handler 调用，打日志前后清屏/重绘 ----
     def clear_line(self) -> None:
-        if self.enabled and self.is_tty and self._last_len:
+        if self.enabled and self._is_owner() and self.is_tty and self._last_len:
             sys.stderr.write("\r" + " " * self._last_len + "\r")
             sys.stderr.flush()
             self._last_len = 0
 
     def redraw(self) -> None:
-        if self.enabled and self.is_tty:
+        if self.enabled and self._is_owner() and self.is_tty:
             self._render()
 
     def set_current(self, text: str) -> None:
         self.current = text or ""
-        if self.enabled and self.is_tty:
+        if self.enabled and self._is_owner() and self.is_tty:
             self._render()
 
     def advance(self, ok: bool = True, current: str = "") -> None:
@@ -83,7 +92,7 @@ class ProgressBar:
             self._render()
 
     def _render(self, final: bool = False) -> None:
-        if not self.enabled:
+        if not self.enabled or not self._is_owner():
             return
         ratio = self.done / self.total if self.total else 1.0
         elapsed = time.time() - self.started_at

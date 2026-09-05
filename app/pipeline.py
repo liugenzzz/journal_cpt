@@ -894,6 +894,30 @@ def run_pipeline(options: PipelineOptions | None = None) -> list[dict[str, Any]]
             label = f"{label} 失败"
         return ok, label
 
+    # 多进程时进度条只在父进程渲染，子进程的日志会不断把它顶走；
+    # 这条按篇打的汇总是不依赖终端渲染的真实进度。
+    run_logger = configure_logger(str(cfg.get("logger_name") or __name__), cfg["runtime"].get("log_level"))
+    tally = {"done": 0, "ok": 0, "skipped": 0, "failed": 0, "samples": 0}
+    run_started_at = time.monotonic()
+
+    def _log_journal_done(result: dict[str, Any]) -> None:
+        tally["done"] += 1
+        tally["samples"] += int(result.get("sample_count") or 0)
+        if result.get("skipped"):
+            tally["skipped"] += 1
+        elif result.get("error"):
+            tally["failed"] += 1
+        else:
+            tally["ok"] += 1
+        elapsed = max(1e-6, time.monotonic() - run_started_at)
+        rate = tally["done"] / elapsed
+        eta = (total - tally["done"]) / rate if rate > 0 else 0.0
+        run_logger.info(
+            "journal done %s/%s ok=%s skipped=%s failed=%s samples=%s 用时=%.1f小时 预计剩余=%.1f小时 last=%s",
+            tally["done"], total, tally["ok"], tally["skipped"], tally["failed"], tally["samples"],
+            elapsed / 3600.0, eta / 3600.0, result.get("journal_id"),
+        )
+
     skip_log = output_root / str(cfg["paths"].get("skipped_journals", "skipped_journals.jsonl"))
 
     def _record_skip(result: dict[str, Any]) -> None:
@@ -918,6 +942,7 @@ def run_pipeline(options: PipelineOptions | None = None) -> list[dict[str, Any]]
                 bar.set_current(journal.journal_id)
                 result = _process_journal(journal, cfg, shared_vlm)
                 _record_skip(result)
+                _log_journal_done(result)
                 ok, label = _summarize(result)
                 bar.advance(ok=ok, current=label)
                 results.append(result)
@@ -940,6 +965,7 @@ def run_pipeline(options: PipelineOptions | None = None) -> list[dict[str, Any]]
                     }
                 ordered_results[index] = result
                 _record_skip(result)
+                _log_journal_done(result)
                 ok, label = _summarize(result)
                 bar.advance(ok=ok, current=label)
     return [result for result in ordered_results if result is not None]
