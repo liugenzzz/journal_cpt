@@ -187,3 +187,57 @@ class QuotaScalingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProviderNameUniquenessTests(unittest.TestCase):
+    """name 是 vlm_cooldown/<name>.cooldown 的文件名，重名会让实例共用冷却状态。"""
+
+    def _cfg(self, providers):
+        return {
+            "runtime": {"output_root": ""},
+            "vlm_pool": {"providers": providers},
+            "prompts": {"system": ""},
+        }
+
+    def _provider(self, name, port):
+        return {
+            "name": name,
+            "model": "Qwen3.8-27B",
+            "url": f"http://127.0.0.1:{port}/v1/chat/completions",
+            "timeout": 60,
+            "max_concurrency": 2,
+        }
+
+    def test_duplicate_names_are_rejected(self) -> None:
+        cfg = self._cfg([self._provider("same", 8001), self._provider("same", 8002)])
+        with self.assertRaises(ValueError) as ctx:
+            VlmPool.from_config(cfg, cfg["prompts"])
+        self.assertIn("same", str(ctx.exception))
+
+    def test_unique_names_are_accepted(self) -> None:
+        cfg = self._cfg([self._provider("a-8001", 8001), self._provider("b-8002", 8002)])
+        pool = VlmPool.from_config(cfg, cfg["prompts"])
+        self.assertEqual([c.name for c in pool.clients], ["a-8001", "b-8002"])
+
+    def test_shipped_config_has_unique_names(self) -> None:
+        from journal_cpt.core.config_loader import load_config
+
+        cfg = load_config()
+        pool = VlmPool.from_config(cfg, cfg["prompts"])
+        names = [client.name for client in pool.clients]
+        self.assertEqual(len(names), len(set(names)), f"重名: {names}")
+        self.assertEqual(len(names), 16)
+        self.assertEqual(sum(client.max_concurrency for client in pool.clients), 256)
+
+    def test_local_pool_keeps_the_real_model_name(self) -> None:
+        from journal_cpt.core.config_loader import load_config
+
+        cfg = load_config()
+        pool = VlmPool.from_config(cfg, cfg["prompts"])
+        local = [c for c in pool.clients if c.cfg["url"].startswith("http://10.")]
+        self.assertEqual(len(local), 12)
+        for client in local:
+            self.assertEqual(client.model, "Qwen3.8-27B")
+            self.assertEqual(client.cfg["api_key"], "local-pool-key")
+            self.assertEqual(client.cfg["max_tokens"], 8192)
+            self.assertEqual(client.cfg["chat_template_kwargs"], {"enable_thinking": False})

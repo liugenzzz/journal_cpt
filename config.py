@@ -17,6 +17,47 @@ TASK_TYPES = [
     "domain_knowledge_corpus",
 ]
 
+# 本地 27B 推理池：同一个模型起了多个实例，只有地址不同。
+# name 必须唯一 —— 它是 .runtime/vlm_cooldown/<name>.cooldown 的文件名，也是日志里的标识；
+# 重名会让这些实例共用一份冷却状态，一个挂了其余全被连坐。
+# model 才是发给服务端的模型名，保持一致。
+LOCAL_27B_ENDPOINTS = [
+    ("10.107.230.59", 8001),
+    ("10.107.230.59", 8002),
+    ("10.107.230.59", 8003),
+    ("10.107.230.59", 8004),
+    ("10.200.100.103", 8001),
+    ("10.200.100.103", 8002),
+    ("10.200.100.103", 8003),
+    ("10.200.100.103", 8004),
+    ("10.107.238.7", 8001),
+    ("10.107.238.7", 8002),
+    ("10.107.238.7", 8003),
+    ("10.107.238.7", 8004),
+]
+
+
+def _local_27b_providers() -> list[dict]:
+    return [
+        {
+            "name": f"Qwen3.8-27B-{host.rsplit('.', 1)[-1]}-{port}",
+            "url": f"http://{host}:{port}/v1/chat/completions",
+            "model": "Qwen3.8-27B",
+            "api_key": "local-pool-key",
+            "stream": False,
+            "temperature": 0.6,
+            "max_tokens": 8192,
+            "timeout": 2400,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "capabilities": ["text", "image"],
+            "task_types": TASK_TYPES,
+            "weight": 1,
+            "max_concurrency": 16,
+        }
+        for host, port in LOCAL_27B_ENDPOINTS
+    ]
+
+
 PROMPTS = {
     "system": (
         "你是多模态期刊数据处理专家、数据工程架构师和航空领域论文数据集构建专家。"
@@ -367,8 +408,8 @@ CFG = {
                 "task_types": TASK_TYPES,
                 "weight": 3,
                 "max_concurrency": 16,
-        },
-
+            },
+            *_local_27b_providers(),
         ],
     },
     "routing": {

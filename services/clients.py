@@ -452,6 +452,16 @@ class VlmPool:
             provider_cfg.setdefault("task_types", [])
             clients.append(_PooledVlmClient(VlmClient(provider_cfg, prompts), provider_cfg, shared_cooldown))
 
+        seen_names: dict[str, int] = {}
+        for client in clients:
+            seen_names[client.name] = seen_names.get(client.name, 0) + 1
+        duplicates = sorted(name for name, count in seen_names.items() if count > 1)
+        if duplicates:
+            # name 是冷却状态的文件名，重名会让多个实例共用一份，一个挂了其余全被连坐。
+            raise ValueError(
+                "VLM provider names must be unique, duplicated: " + ", ".join(duplicates)
+            )
+
         return cls(
             clients,
             fallback_enabled=bool(fallback_cfg.get("enabled", True)),
