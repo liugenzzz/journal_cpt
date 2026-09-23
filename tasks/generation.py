@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ..core.io_utils import clean_text, safe_name, truncate_text, utc_now
+from ..processing.normalize import is_multi_column_mode
 from ..core.models import JournalSampleJob
 from ..services.clients import VlmPool, parse_json_array, parse_jsonl_objects
 
@@ -84,7 +85,7 @@ TASK_SPECS: dict[str, dict[str, Any]] = {
             "uncertainty_notes",
         ],
         "quality_rules": [
-            "必须区分通栏、左栏、右栏和跨栏图表；跨栏图表是双栏阅读的纵向分隔点，读取左栏时一旦到达跨栏图表，应先转读同一纵向带内的右栏内容，不得继续读跨栏图表下方的左栏内容；读完该带右栏后再读跨栏图表，再进入图表下方的新双栏区域。",
+            "必须区分通栏、各个栏和跨栏图表，栏数以版面实际情况为准（可能是单栏、双栏或三栏及以上）；跨栏图表是多栏阅读的纵向分隔点，读取某一栏时一旦到达跨栏图表，应先转读同一纵向带内右侧各栏的内容，不得继续读跨栏图表下方本栏的内容；读完该带右侧各栏后再读跨栏图表，再进入图表下方的新一带。",
             "回答要覆盖页面主要正文、图表/表格/公式和应过滤内容，不得把页眉页脚混入正文读序。",
         ],
     },
@@ -150,7 +151,7 @@ TASK_SPECS: dict[str, dict[str, Any]] = {
         "format": "sharegpt",
         "input_fields": ["page_images", "page_texts"],
         "output_fields": ["page_visual_descriptions", "context_topic", "page_roles", "cross_page_summary", "continuity_relations", "figures_tables_formulas", "key_points_by_page"],
-        "quality_rules": ["必须依赖至少两页证据；输入图片应为 2-5 张连续页面图；回答要覆盖跨页正文、图表/表格/公式和页面间承接关系，无清晰关联时返回 []。"],
+        "quality_rules": ["必须依赖至少两页证据；输入图片应为 2-3 张连续页面图；回答要覆盖跨页正文、图表/表格/公式和页面间承接关系，无清晰关联时返回 []。"],
     },
     "domain_knowledge_corpus": {
         "format": "pt",
@@ -369,8 +370,8 @@ def _template_input(job: JournalSampleJob, cfg: dict[str, Any]) -> dict[str, Any
             "current_reading_order_blocks": job.page.reading_order_blocks,
             "cross_column_barriers": _cross_column_barriers(job),
             "cross_column_barrier_policy": (
-                "在两栏正文中，跨栏图表是纵向分隔点；读取左栏时若到达跨栏图表位置，"
-                "应先转读同一纵向带内的右栏内容，再读取该跨栏图表，然后再进入图表下方的新双栏区域。"
+                "在多栏正文中，跨栏图表是纵向分隔点；读取某一栏时若到达跨栏图表位置，"
+                "应先转读同一纵向带内右侧各栏的内容，再读取该跨栏图表，然后再进入图表下方的新一带。"
             ),
         }
     if job.task_type == "page_to_journal_layout_description":
@@ -428,7 +429,7 @@ def _template_input(job: JournalSampleJob, cfg: dict[str, Any]) -> dict[str, Any
             "page_images": list(job.images[:3]),
             "page_texts": _page_texts(job, int(cfg["generation"]["max_neighbor_context_chars"])),
             "article_title": job.page.article_title,
-            "image_count_policy": "Use 2-5 page images for this task.",
+            "image_count_policy": "Use 2-3 page images for this task.",
         }
     return {"source_text": truncate_text(job.page.full_text, max_page_chars)}
 
@@ -619,12 +620,13 @@ def _prompt(job: JournalSampleJob, cfg: dict[str, Any]) -> str:
         )
         if job.task_type == "two_column_reading_order_reconstruction":
             instruction_rule += (
-                " 对双栏正文，阅读顺序必须按纵向带恢复；跨栏图表会截断当前带，读左栏时到达跨栏图表位置后，"
-                "先读同一带右栏内容，再读跨栏图表，然后再读图表下方的新带，不能把跨栏图表下方左栏提前到右栏之前。"
+                " 对多栏正文，阅读顺序必须按纵向带恢复；栏数以版面实际情况为准，按从左到右逐栏、栏内从上到下读取。"
+                "跨栏图表会截断当前带，读某一栏时到达跨栏图表位置后，先读同一带内右侧各栏的内容，再读跨栏图表，"
+                "然后再读图表下方的新带，不能把跨栏图表下方本栏的内容提前到右侧各栏之前。"
             )
     elif job.task_type == "cross_page_article_context":
         instruction_rule += (
-            " 必须逐页观察 2-5 张连续页面图像，生成 page_visual_descriptions；"
+            " 必须逐页观察 2-3 张连续页面图像，生成 page_visual_descriptions；"
             "问题要指向这些连续页面的上下文衔接，答案要覆盖各页主要正文、图表/表格/公式和跨页承接关系。"
         )
     return f"{prompt}\n\n{instruction_rule}\n\n{JSON_OUTPUT_INSTRUCTION}\n\nInput JSON:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
@@ -852,7 +854,7 @@ def _cross_column_barriers(job: JournalSampleJob) -> list[dict[str, Any]]:
                 "left_column_blocks_before_barrier": left_before,
                 "right_column_blocks_before_barrier": right_before,
                 "columns_before_barrier": by_column,
-                "reading_policy": "When scanning the left column, stop at this cross-column visual barrier; read the right-column blocks in the same vertical band before reading the barrier and before any left-column blocks below it.",
+                "reading_policy": "When scanning any column, stop at this cross-column visual barrier; read the blocks of the columns to its right within the same vertical band before reading the barrier, and before any blocks of the current column below it.",
             }
         )
         band_top = _block_bottom(barrier)
@@ -1102,7 +1104,7 @@ def _heuristic_output(job: JournalSampleJob, cfg: dict[str, Any]) -> tuple[str, 
     if job.task_type == "article_metadata_extraction":
         return "请从该期刊论文首页内容中抽取文章元数据。", _article_metadata_output(job)
     if job.task_type == "two_column_reading_order_reconstruction":
-        return "请根据该期刊页面的 OCR 块和坐标恢复双栏阅读顺序。", {
+        return "请根据该期刊页面的 OCR 块和坐标恢复多栏阅读顺序。", {
             "page_visual_description": _page_visual_description(job),
             "column_mode": job.page.column_mode,
             "filtered_noise_blocks": _noise_block_ids(job),
@@ -1135,7 +1137,13 @@ def _heuristic_output(job: JournalSampleJob, cfg: dict[str, Any]) -> tuple[str, 
             "controlled_block_ids": [block.block_id for block in job.blocks if block.block_id != (job.block.block_id if job.block else "")],
             "scope_summary": _first_sentence(controlled_text, 260),
             "alignment_judgement": "对齐",
-            "mismatch_risk": "未发现明显不匹配风险" if "two_column" not in job.page.column_mode else "双栏或图表插入可能造成正文范围边界不确定",
+            "mismatch_risk": (
+                # 原来写的是 '"two_column" not in column_mode'，三栏页(three_column)匹配不到，
+                # 会被误判成"未发现明显不匹配风险"。
+                "多栏排版或图表插入可能造成正文范围边界不确定"
+                if is_multi_column_mode(job.page.column_mode)
+                else "未发现明显不匹配风险"
+            ),
         }
     if job.task_type == "section_keypoint_summary":
         section_text = clean_text(text.get("section_text"))
