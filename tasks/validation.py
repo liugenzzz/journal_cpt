@@ -158,12 +158,22 @@ def _figure_instruction_is_generic(sample: dict[str, Any], cfg: dict[str, Any]) 
     return True
 
 
-def _cross_page_images_ok(sample: dict[str, Any], cfg: dict[str, Any]) -> bool:
-    if str(sample.get("task_type") or "") != "cross_page_article_context":
-        return True
+def cross_page_image_bounds(cfg: dict[str, Any]) -> tuple[int, int]:
+    """跨页任务允许的页数区间，唯一来源是 routing 配置。
+
+    想支持更多页只改 routing.cross_page_window / cross_page_max_images 即可，
+    校验这边不再有第二份写死的数字。
+    """
     routing = cfg.get("routing", {})
     min_images = max(2, int(routing.get("cross_page_min_images", 2)))
     max_images = max(min_images, int(routing.get("cross_page_max_images", 3)))
+    return min_images, max_images
+
+
+def _cross_page_images_ok(sample: dict[str, Any], cfg: dict[str, Any]) -> bool:
+    if str(sample.get("task_type") or "") != "cross_page_article_context":
+        return True
+    min_images, max_images = cross_page_image_bounds(cfg)
     images = sample.get("images") if isinstance(sample.get("images"), list) else []
     return min_images <= len(images) <= max_images
 
@@ -510,8 +520,11 @@ def _image_question_correspondence_quality(sample: dict[str, Any], output_dir: P
             and bool(clean_text(payload.get("caption_text")) or clean_text(payload.get("related_context_text")) or payload.get("target_block"))
         )
     if task_type == "cross_page_article_context":
+        # 原来这里写死 2..3，不读配置：把 cross_page_max_images 调大之后，
+        # 超过 3 页的样本会丢掉这条兜底判据，被质量校验误杀。
+        cross_min, cross_max = cross_page_image_bounds(cfg)
         support_ok = support_ok or (
-            2 <= len(images) <= 3
+            cross_min <= len(images) <= cross_max
             and (bool(output.get("page_roles")) or bool(output.get("key_points_by_page")))
         )
     if task_type == "evidence_to_claim_chain":
