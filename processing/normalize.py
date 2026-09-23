@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import asdict
 from pathlib import Path
@@ -15,7 +16,7 @@ from ..core.models import (
 )
 
 
-NORMALIZER_VERSION = "paragraph_cross_page_crossbarrier_subfig_v2"
+NORMALIZER_VERSION = "paragraph_crosspage_ncolumn_sellerwatermark_v3"
 
 SUBFIGURE_MARK_RE = re.compile(r"[\(（]\s*([A-Za-z])\s*[\)）]")
 FIGURE_LABEL_RE = re.compile(r"((?:\u56fe|Fig\.?|Figure)\s*[0-9\uff10-\uff19]+)", flags=re.IGNORECASE)
@@ -98,8 +99,34 @@ def _center_y(block: JournalBlockRecord) -> float:
     return (box[1] + box[3]) / 2 if box else _top(block)
 
 
+_COLUMN_WORDS = {1: "single", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
+
+
 def _is_two_column_mode(column_mode: str) -> bool:
     return "two_column" in str(column_mode or "")
+
+
+def is_multi_column_mode(column_mode: str) -> bool:
+    """两栏及以上。三栏杂志不能再走"单栏按 y 排"的老路。"""
+    mode = str(column_mode or "")
+    return any(f"{word}_column" in mode for count, word in _COLUMN_WORDS.items() if count >= 2)
+
+
+def column_count(column_mode: str) -> int:
+    mode = str(column_mode or "")
+    for count, word in sorted(_COLUMN_WORDS.items(), reverse=True):
+        if f"{word}_column" in mode:
+            return count
+    return 0
+
+
+def _column_name(index: int, total: int) -> str:
+    """两栏沿用 left/right，下游既有逻辑和导出标签都不用改；三栏以上用 col1..colN。"""
+    if total == 1:
+        return "single"
+    if total == 2:
+        return "left" if index == 0 else "right"
+    return f"col{index + 1}"
 
 
 def _sort_blocks_in_reading_order(blocks: list[JournalBlockRecord]) -> list[JournalBlockRecord]:
@@ -355,8 +382,18 @@ def _caption_note_for_subfigure_chunk(
     return f"子图抽取说明：本裁剪已合并{label}的{chunk_text}子图。"
 
 
-def _semantic_role(block_type: str, text: str, box: tuple[float, float, float, float] | None, page_height: int, page_no: int) -> str:
+def _semantic_role(
+    block_type: str,
+    text: str,
+    box: tuple[float, float, float, float] | None,
+    page_height: int,
+    page_no: int,
+    cfg: dict[str, Any] | None = None,
+) -> str:
     text = clean_text(text)
+    # 卖家水印优先判定：它在页脚，但 MinerU 不一定把它切成 footer 类型。
+    if looks_like_seller_watermark(text, cfg or {}):
+        return "watermark"
     if block_type == "header":
         return "journal_header"
     if block_type == "footer":
@@ -392,49 +429,156 @@ def _semantic_role(block_type: str, text: str, box: tuple[float, float, float, f
     return "body" if text else "unknown"
 
 
-def _assign_columns(blocks: list[JournalBlockRecord], width: int) -> str:
+def _layout_cfg(cfg: dict[str, Any] | None) -> dict[str, Any]:
+    return (cfg or {}).get("layout", {})
+
+
+def _column_bands(blocks: list[JournalBlockRecord], width: float, cfg: dict[str, Any] | None) -> list[tuple[float, float]]:
+    """从"窄块"的水平覆盖投影里找出每一栏的左右边界。
+
+    原来的做法是假设两栏、按页宽中线劈开，三栏版面直接崩：中间那栏正好横跨中线，
+    会被 crosses_mid 判成跨栏图表，读序整个乱掉。
+    这里改成先找栏：把明显跨栏的宽块排除掉，剩下的窄块在 x 轴上投影，
+    连续被覆盖的区间就是一栏，区间之间的空白就是栏间距。栏数由数据决定。
+    """
+    layout = _layout_cfg(cfg)
+    bins = max(50, int(layout.get("column_scan_bins", 400)))
+    min_gutter = float(layout.get("min_gutter_ratio", 0.012))
+    min_band = float(layout.get("min_band_ratio", 0.06))
+    max_columns = max(1, int(layout.get("max_columns", 6)))
+    ratios = [float(r) for r in layout.get("narrow_scan_ratios", [0.45, 0.55, 0.65, 0.75, 0.85])]
+
+    def scan(max_narrow: float) -> list[tuple[float, float]]:
+        cover = [0] * bins
+        for block in blocks:
+            box = _box(block)
+            if not box:
+                continue
+            if (box[2] - box[0]) >= width * max_narrow:
+                continue
+            lo = max(0, min(bins - 1, int(box[0] / width * bins)))
+            hi = max(lo + 1, min(bins, int(math.ceil(box[2] / width * bins))))
+            for index in range(lo, hi):
+                cover[index] += 1
+
+        gap_bins = max(1, int(round(min_gutter * bins)))
+        runs: list[tuple[int, int]] = []
+        start: int | None = None
+        gap = 0
+        for index in range(bins):
+            if cover[index] > 0:
+                if start is None:
+                    start = index
+                gap = 0
+            elif start is not None:
+                gap += 1
+                if gap >= gap_bins:
+                    runs.append((start, index - gap + 1))
+                    start = None
+                    gap = 0
+        if start is not None:
+            runs.append((start, bins))
+        return [
+            (lo / bins * width, hi / bins * width)
+            for lo, hi in runs
+            if (hi - lo) / bins >= min_band
+        ]
+
+    # 单一阈值分不开这两种情况：非对称两栏里 0.57 宽的正文栏是真栏，
+    # 三栏页里 0.65 宽的两栏跨图是假栏。
+    # 但跨栏块只会把相邻栏"粘成一条"，永远不会把一栏劈成两条 ——
+    # 所以在几个阈值里取栏数最多的那次结果，就是真实栏数。
+    best: list[tuple[float, float]] = []
+    for ratio in sorted(set(ratios)):
+        found = scan(ratio)
+        if len(found) > len(best) and len(found) <= max_columns:
+            best = found
+    return best
+
+
+def _assign_columns(blocks: list[JournalBlockRecord], width: int, cfg: dict[str, Any] | None = None) -> str:
     if not blocks:
         return "unknown"
     if width <= 0:
         width = int(max((box[2] for block in blocks if (box := _box(block))), default=0))
     if width <= 0:
         return "unknown"
-    left_count = 0
-    right_count = 0
+
+    bands = _column_bands(blocks, float(width), cfg)
+    if not bands:
+        # 整页通栏（大图跨页、满版照片）时所有块都比 max_narrow_ratio 宽，
+        # 投影里找不到栏。这时把内容范围当成唯一一栏，行为和改造前一致。
+        boxes = [box for block in blocks if (box := _box(block))]
+        if not boxes:
+            for block in blocks:
+                block.column = "unknown"
+                block.column_index = -1
+                block.span_kind = "single_column"
+            return "unknown"
+        bands = [(min(box[0] for box in boxes), max(box[2] for box in boxes))]
+    total = len(bands)
+
+    overlap_ratio = float(_layout_cfg(cfg).get("band_overlap_ratio", 0.35))
+    column_counts = [0] * total
     full_count = 0
-    mid = width / 2.0
+    cross_count = 0
     for block in blocks:
         box = _box(block)
         if not box:
             block.column = "unknown"
+            block.column_index = -1
             block.span_kind = "single_column"
             continue
-        block_width = box[2] - box[0]
-        crosses_mid = box[0] < width * 0.42 and box[2] > width * 0.58
-        if block_width >= width * 0.62 or crosses_mid:
+        block_width = max(1e-6, box[2] - box[0])
+        hit = []
+        for index, (low, high) in enumerate(bands):
+            overlap = min(box[2], high) - max(box[0], low)
+            if overlap > min(block_width, high - low) * overlap_ratio:
+                hit.append(index)
+        if len(hit) == 1:
+            index = hit[0]
+            block.column = _column_name(index, total)
+            block.column_index = index
+            block.span_kind = "single_column"
+            column_counts[index] += 1
+        elif len(hit) > 1:
             block.column = "full_width"
-            block.span_kind = "full_width" if block_width >= width * 0.78 else "cross_column"
-            full_count += 1
-        elif _center_x(block) < mid:
-            block.column = "left"
-            block.span_kind = "single_column"
-            left_count += 1
+            block.column_index = -1
+            if len(hit) >= total:
+                block.span_kind = "full_width"
+                full_count += 1
+            else:
+                block.span_kind = "cross_column"
+                cross_count += 1
         else:
-            block.column = "right"
+            # 没压到任何栏（页边噪声之类）：归到中心点最近的一栏。
+            center = _center_x(block)
+            index = min(range(total), key=lambda i: abs(center - (bands[i][0] + bands[i][1]) / 2.0))
+            block.column = _column_name(index, total)
+            block.column_index = index
             block.span_kind = "single_column"
-            right_count += 1
-    if left_count >= 2 and right_count >= 2:
-        return "mixed_full_width_and_two_column" if full_count else "two_column"
-    if full_count and (left_count or right_count):
+            column_counts[index] += 1
+
+    # 旧代码要求"每栏至少 2 块"，是为了防止按中线硬切造成的假两栏。
+    # 现在栏是从投影聚类出来的，本身就可靠，只要该栏有内容就算数 ——
+    # 否则三栏页里某一栏只有一段正文时，会被误报成两栏。
+    populated = sum(1 for count in column_counts if count >= 1)
+    spanning = full_count + cross_count
+    if populated >= 2:
+        word = _COLUMN_WORDS.get(populated, f"{populated}")
+        return f"mixed_full_width_and_{word}_column" if spanning else f"{word}_column"
+    if spanning and any(column_counts):
         return "mixed_full_width_and_single_column"
-    if full_count:
+    if spanning:
         return "full_width"
-    if left_count or right_count:
+    if any(column_counts):
         return "single_column"
     return "unknown"
 
 
 def _noise(block: JournalBlockRecord) -> bool:
+    if block.semantic_role == "watermark":
+        return True
     return block.semantic_role in {"journal_header", "footer", "page_number", "unknown"} and not clean_text(block.text)
 
 
@@ -594,26 +738,34 @@ def _reconstruct_paragraphs(pages: list[JournalPageRecord]) -> None:
         page.full_text = "\n\n".join(clean_text(paragraph.get("text")) for paragraph in page.paragraphs if clean_text(paragraph.get("text")))
 
 
+def _column_index_of(block: JournalBlockRecord) -> int:
+    """栏序号；老数据没有 column_index 时退回按 left/right 推断。"""
+    index = getattr(block, "column_index", -1)
+    if isinstance(index, int) and index >= 0:
+        return index
+    return {"left": 0, "right": 1}.get(block.column, -1)
+
+
 def _emit_column_band(blocks: list[JournalBlockRecord]) -> list[JournalBlockRecord]:
-    left = sorted([block for block in blocks if block.column == "left"], key=lambda item: (_top(item), _left(item)))
-    right = sorted([block for block in blocks if block.column == "right"], key=lambda item: (_top(item), _left(item)))
-    other = sorted([block for block in blocks if block.column not in {"left", "right"}], key=lambda item: (_top(item), _left(item)))
-    return left + right + other
+    """一个纵向带内：从左到右逐栏输出，每栏内部从上到下。"""
+    in_columns = [block for block in blocks if _column_index_of(block) >= 0]
+    other = [block for block in blocks if _column_index_of(block) < 0]
+    ordered = sorted(in_columns, key=lambda item: (_column_index_of(item), _top(item), _left(item)))
+    return ordered + sorted(other, key=lambda item: (_top(item), _left(item)))
 
 
 def _recover_reading_order(blocks: list[JournalBlockRecord], column_mode: str) -> list[JournalBlockRecord]:
     content = [block for block in blocks if not _noise(block)]
-    if not _is_two_column_mode(column_mode):
+    if not is_multi_column_mode(column_mode):
         ordered = sorted(content, key=lambda item: (_top(item), _left(item), item.reading_order))
     else:
-        column_blocks = [block for block in content if block.column in {"left", "right"}]
-        left = [block for block in column_blocks if block.column == "left"]
-        right = [block for block in column_blocks if block.column == "right"]
+        column_blocks = [block for block in content if _column_index_of(block) >= 0]
+        distinct_columns = {_column_index_of(block) for block in column_blocks}
         separators = sorted(
-            [block for block in content if block.column not in {"left", "right"}],
+            [block for block in content if _column_index_of(block) < 0],
             key=lambda item: (_top(item), _left(item), item.reading_order),
         )
-        if not left or not right:
+        if len(distinct_columns) < 2:
             ordered = sorted(content, key=lambda item: (_top(item), _left(item), item.reading_order))
         else:
             ordered = []
@@ -635,20 +787,48 @@ def _recover_reading_order(blocks: list[JournalBlockRecord], column_mode: str) -
 
 
 def _two_column_left_then_right_ok(blocks: list[JournalBlockRecord], column_mode: str) -> bool:
-    if not _is_two_column_mode(column_mode):
+    """同一个纵向带里，栏序号必须单调不减：读完右栏又跳回左栏就是读序出错。
+
+    原来只认 left/right 两栏；三栏以上按 column_index 判断。
+    """
+    if not is_multi_column_mode(column_mode):
         return True
-    seen_right = False
-    has_left = False
-    has_right = False
+    highest = -1
+    seen: set[int] = set()
     for block in _sort_blocks_in_reading_order([item for item in blocks if not _noise(item)]):
-        if block.column == "right":
-            seen_right = True
-            has_right = True
-        elif block.column == "left":
-            has_left = True
-            if seen_right:
-                return False
-    return has_left and has_right
+        index = _column_index_of(block)
+        if index < 0:
+            highest = -1  # 跨栏块结束当前带，下一带允许从头开始
+            continue
+        seen.add(index)
+        if index < highest:
+            return False
+        highest = max(highest, index)
+    return len(seen) >= 2
+
+
+def _matches_any(compact: str, patterns: Any) -> bool:
+    for pattern in patterns or []:
+        try:
+            if re.search(str(pattern), compact, flags=re.IGNORECASE):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def looks_like_seller_watermark(text: str, cfg: dict[str, Any]) -> bool:
+    """卖家加的推广文字（逐页页脚、二维码页）。
+
+    这批杂志是买来的整期扫描件，每页页脚都印着一行
+    "PDF过刊杂志收藏购买微信：bfwz888888"，OCR 后会混进每一页的正文。
+    命中的块标成 watermark，既有的 _skip_from_train_text / routing.skip_roles
+    就会把它从训练文本里剔除。
+    """
+    noise_cfg = cfg.get("page_noise", {})
+    if not bool(noise_cfg.get("enabled", True)):
+        return False
+    return _matches_any(clean_text(text), noise_cfg.get("strong_patterns", []))
 
 
 def _noise_signal_count(compact: str, cfg: dict[str, Any]) -> int:
@@ -676,6 +856,9 @@ def _looks_like_advertisement(compact: str, cfg: dict[str, Any]) -> bool:
     min_signals = max(1, int(noise_cfg.get("min_signals", 2)))
     strong_signals = max(min_signals, int(noise_cfg.get("strong_signals", 4)))
     max_text_chars = max(0, int(noise_cfg.get("max_text_chars", 1200)))
+    # 强特征命中一条就够：纯二维码推广页正文只有二三十个字，凑不出多个特征。
+    if _matches_any(compact, noise_cfg.get("strong_patterns", [])):
+        return True
     hits = _noise_signal_count(compact, cfg)
     if hits >= strong_signals:
         return True
@@ -1052,10 +1235,10 @@ def _build_page(
     width, height = _page_size(output_dir, page_image, blocks)
     layout_width, layout_height = _layout_size(blocks, width, height)
     for block in blocks:
-        block.semantic_role = _semantic_role(block.block_type, block.text, _box(block), layout_height, page_no)
+        block.semantic_role = _semantic_role(block.block_type, block.text, _box(block), layout_height, page_no, cfg)
         if _looks_like_watermark_text(block.text, cfg):
             block.semantic_role = "watermark"
-    column_mode = _assign_columns(blocks, layout_width)
+    column_mode = _assign_columns(blocks, layout_width, cfg)
     ordered = _recover_reading_order(blocks, column_mode)
     blocks = _sort_blocks_in_reading_order(ordered)
     raw_text = "\n".join(block.text for block in ordered if clean_text(block.text))

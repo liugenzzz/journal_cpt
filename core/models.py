@@ -32,6 +32,9 @@ class JournalBlockRecord:
     markdown: str = ""
     reading_order: int = 0
     column: str = "unknown"
+    # 0 起的栏序号（从左到右）。跨栏/通栏块为 -1。
+    # 三栏以上时 column 是 col1..colN，靠这个字段排序比解析字符串稳。
+    column_index: int = -1
     span_kind: str = "single_column"
     confidence: float = 0.0
     image_path: str = ""

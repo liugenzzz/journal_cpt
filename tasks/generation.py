@@ -829,16 +829,20 @@ def _cross_column_barriers(job: JournalSampleJob) -> list[dict[str, Any]]:
     band_top = float("-inf")
     for barrier in barriers:
         barrier_top = _block_top(barrier)
-        left_before = [
-            block.block_id
+        in_band = [
+            block
             for block in job.page.blocks
-            if block.column == "left" and block.semantic_role not in noise_roles and band_top <= _block_top(block) < barrier_top
+            if block.semantic_role not in noise_roles and band_top <= _block_top(block) < barrier_top
         ]
-        right_before = [
-            block.block_id
-            for block in job.page.blocks
-            if block.column == "right" and block.semantic_role not in noise_roles and band_top <= _block_top(block) < barrier_top
-        ]
+        # 两栏沿用原来的 left/right 两个键，payload 形状不变；
+        # 三栏以上额外给一份按栏序号分组的清单。
+        left_before = [block.block_id for block in in_band if block.column == "left"]
+        right_before = [block.block_id for block in in_band if block.column == "right"]
+        by_column: dict[str, list[str]] = {}
+        for block in sorted(in_band, key=lambda item: (getattr(item, "column_index", -1), _block_top(item))):
+            index = getattr(block, "column_index", -1)
+            if isinstance(index, int) and index >= 0:
+                by_column.setdefault(block.column, []).append(block.block_id)
         result.append(
             {
                 "block_id": barrier.block_id,
@@ -847,6 +851,7 @@ def _cross_column_barriers(job: JournalSampleJob) -> list[dict[str, Any]]:
                 "bbox": barrier.bbox,
                 "left_column_blocks_before_barrier": left_before,
                 "right_column_blocks_before_barrier": right_before,
+                "columns_before_barrier": by_column,
                 "reading_policy": "When scanning the left column, stop at this cross-column visual barrier; read the right-column blocks in the same vertical band before reading the barrier and before any left-column blocks below it.",
             }
         )

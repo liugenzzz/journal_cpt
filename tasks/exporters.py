@@ -134,6 +134,13 @@ _BLOCK_TYPE_LABELS = {
 _COLUMN_LABELS = {
     "left": "左栏",
     "right": "右栏",
+    "col1": "第一栏",
+    "col2": "第二栏",
+    "col3": "第三栏",
+    "col4": "第四栏",
+    "col5": "第五栏",
+    "three_column": "三栏",
+    "four_column": "四栏",
     "center": "中部",
     "full": "通栏",
     "full_width": "通栏",

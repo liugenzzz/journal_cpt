@@ -5,6 +5,7 @@ from dataclasses import asdict
 from typing import Any
 
 from ..core.io_utils import clean_text
+from ..processing.normalize import is_multi_column_mode
 from ..core.models import JournalArticleRecord, JournalBlockRecord, JournalPageRecord, JournalRecord, JournalSampleJob
 
 
@@ -215,7 +216,7 @@ def _build_domain_corpus_jobs(
     min_chars = int(routing.get("min_domain_corpus_text_chars", routing.get("min_page_text_chars", 120)))
     target_chars = int(routing.get("domain_corpus_target_input_chars", 8000))
     max_pages = max(1, int(routing.get("domain_corpus_window", 4)))
-    skip_roles = {"journal_header", "footer", "page_number", "reference", "unknown"}
+    skip_roles = {"journal_header", "footer", "page_number", "reference", "unknown", "watermark"}
 
     jobs: list[JournalSampleJob] = []
     article_map = _article_by_id(articles)
@@ -316,7 +317,7 @@ def build_sample_jobs(
             )
 
         if _enabled(enabled, "two_column_reading_order_reconstruction") and (
-            "two_column" in page.column_mode or page.figure_links or page.uncertainty_notes
+            is_multi_column_mode(page.column_mode) or page.figure_links or page.uncertainty_notes
         ):
             jobs.append(
                 JournalSampleJob(
