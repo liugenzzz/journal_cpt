@@ -172,6 +172,25 @@ def _output_paths(journal: JournalRecord, cfg: dict[str, Any]) -> tuple[Path, Pa
     )
 
 
+def ensure_pdf_readable(journal: JournalRecord, cfg: dict[str, Any]) -> None:
+    """独立的 PDF 可读性闸门。
+
+    水印清洗开启时，clean_pdf_watermarks 本来就要读 PDF，坏文件在那里就会抛
+    UnreadablePdfError，这里直接放过，避免白开一次。
+    关闭水印清洗时（比如不带水印的杂志批次），clean_pdf_watermarks 在读文件之前
+    就早退了，那道拦截也就失效 —— 坏 PDF 会一路走到渲染或 MinerU 才炸，而且会被
+    记成 failed 而不是 skipped，混进真正需要排查的错误里。所以这里补上。
+    """
+    if watermark_cleaning_enabled(cfg):
+        return
+    from pypdf import PdfReader  # type: ignore
+
+    try:
+        PdfReader(str(Path(journal.source_pdf)))
+    except Exception as exc:
+        raise UnreadablePdfError(f"{type(exc).__name__}: {exc}") from exc
+
+
 def clean_pdf_watermarks(journal: JournalRecord, cfg: dict[str, Any]) -> WatermarkCleanResult:
     source_pdf = Path(journal.source_pdf)
     cleaned_pdf, report_path = _output_paths(journal, cfg)

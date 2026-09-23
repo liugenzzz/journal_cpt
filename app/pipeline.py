@@ -18,7 +18,7 @@ from ..processing.crop import crop_blocks
 from ..processing.ingest import scan_input_journals, scan_journals
 from ..processing.normalize import normalize_pages
 from ..processing.render import render_pages
-from ..processing.watermark import UnreadablePdfError, clean_pdf_watermarks
+from ..processing.watermark import UnreadablePdfError, clean_pdf_watermarks, ensure_pdf_readable
 from ..services.clients import VlmPool
 from ..services.mineru import mineru_cache_is_valid, parse_journal_with_mineru
 from ..tasks.dedup import deduplicate
@@ -710,6 +710,7 @@ def _process_journal(journal: Any, cfg: dict[str, Any], vlm: VlmPool | None = No
     logger.info("start journal_id=%s pdf=%s", journal.journal_id, journal.source_pdf)
     append_jsonl(output_dir / cfg["paths"]["manifest"], asdict(journal))
     try:
+        ensure_pdf_readable(journal, cfg)
         watermark_result = clean_pdf_watermarks(journal, cfg)
         working_journal = replace(journal, source_pdf=watermark_result.cleaned_pdf) if watermark_result.cleaned else journal
         working_cfg = cfg

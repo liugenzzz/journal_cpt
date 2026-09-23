@@ -72,6 +72,17 @@ provider 之间是**抢占式**分配，不是先排名再指派：线程拿到�
 
 provider 的**冷却状态跨进程共享**，落在 `output_root/.runtime/vlm_cooldown/<provider>.cooldown`。一个 provider 挂掉后所有 journal 进程都会跳过它，不用各自再踩一次。冷却是低频写、高频读，所以写立即落盘、读带 `runtime.cooldown_refresh_seconds`（默认 1 秒）的内存缓存；时间戳用 wall clock，因为 `time.monotonic()` 跨进程不可比。
 
+## 按 prompt 长度选 provider
+
+provider 可以配 `max_prompt_chars`(按上下文窗口折算:`(context - max_tokens) × 1.2 字符/token`,宁可低估)。调度时先按能力筛(`task_types` / `capabilities`),再按 prompt 长度筛——上下文装不下的实例直接跳过,不会发过去换回一个 400。
+
+两类错误分开报:
+
+- 能力不匹配 → `No image-capable VLM provider is configured for task_type=...`
+- 全部装不下 → `Prompt too long for every eligible VLM provider: ... largest_provider_budget=...`
+
+`max_prompt_chars` 为 0 表示不限。
+
 ## MinerU 实例池
 
 `mineru.providers` 可以配多台 MinerU。槽位是 `output_root/.runtime/mineru_slots/<provider>/slot_N.lock` 文件锁，**跨进程乃至跨主机**（只要 `output_root` 是共享盘）都成立，因此并发上限对整批任务都有效，不像 VLM 侧的信号量只在进程内。

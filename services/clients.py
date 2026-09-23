@@ -305,6 +305,8 @@ class _PooledVlmClient:
         self.model = str(cfg.get("model") or "")
         self.weight = max(1, int(cfg.get("weight") or 1))
         self.max_concurrency = max(1, int(cfg.get("max_concurrency") or 1))
+        # 这个 provider 能吃下的 prompt 字符上限（按上下文窗口折算），0 表示不限。
+        self.max_prompt_chars = max(0, int(cfg.get("max_prompt_chars") or 0))
         self.task_types = {str(item) for item in cfg.get("task_types", []) if str(item)}
         self.capabilities = {str(item) for item in cfg.get("capabilities", []) if str(item)}
         self._semaphore = threading.BoundedSemaphore(self.max_concurrency)
@@ -354,6 +356,10 @@ class _PooledVlmClient:
         if has_images and "image" not in self.capabilities:
             return False
         return True
+
+    def fits_prompt(self, prompt_chars: int) -> bool:
+        """上下文窗口小的实例不该收大 payload —— 发过去只会换回一个 400。"""
+        return not self.max_prompt_chars or prompt_chars <= self.max_prompt_chars
 
     def try_acquire(self) -> bool:
         """非阻塞占一个槽位；占不到立刻返回 False，让调用方去问下一个 provider。"""
@@ -469,12 +475,21 @@ class VlmPool:
             cooldown_seconds=float(fallback_cfg.get("cooldown_seconds", 300.0)),
         )
 
-    def _candidates(self, task_type: str, has_images: bool) -> list[_PooledVlmClient]:
-        candidates = [client for client in self.clients if client.supports(task_type, has_images)]
-        if candidates:
-            return candidates
-        requirement = "image-capable " if has_images else ""
-        raise RuntimeError(f"No {requirement}VLM provider is configured for task_type={task_type}.")
+    def _candidates(self, task_type: str, has_images: bool, prompt_chars: int = 0) -> list[_PooledVlmClient]:
+        eligible = [client for client in self.clients if client.supports(task_type, has_images)]
+        if not eligible:
+            requirement = "image-capable " if has_images else ""
+            raise RuntimeError(f"No {requirement}VLM provider is configured for task_type={task_type}.")
+        fits = [client for client in eligible if client.fits_prompt(prompt_chars)]
+        if fits:
+            return fits
+        # 能力上够用但上下文都装不下，报错要说清是哪一边的问题。
+        largest = max((client.max_prompt_chars for client in eligible), default=0)
+        raise RuntimeError(
+            f"Prompt too long for every eligible VLM provider: task_type={task_type} "
+            f"prompt_chars={prompt_chars} largest_provider_budget={largest} "
+            "—— 调小 generation.max_prompt_chars，或给 provider 配更大的 max_prompt_chars"
+        )
 
     def _ordered_candidates(self, candidates: list[_PooledVlmClient]) -> list[_PooledVlmClient]:
         """按空闲程度排序：刚跑完的 provider 占用率最低，会排在最前面。
@@ -521,7 +536,7 @@ class VlmPool:
 
     def chat(self, task_type: str, prompt: str, images: list[Path] | None = None) -> VlmResponse:
         has_images = bool(images)
-        candidates = self._candidates(task_type, has_images)
+        candidates = self._candidates(task_type, has_images, len(prompt))
         now = float(self._now_fn())
         all_cooling_down = all(client.is_cooling_down(now) for client in candidates)
         if self.fallback_enabled:

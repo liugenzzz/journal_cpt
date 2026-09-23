@@ -21,20 +21,31 @@ TASK_TYPES = [
 # name 必须唯一 —— 它是 .runtime/vlm_cooldown/<name>.cooldown 的文件名，也是日志里的标识；
 # 重名会让这些实例共用一份冷却状态，一个挂了其余全被连坐。
 # model 才是发给服务端的模型名，保持一致。
+# 第三列是运维清单上的状态：在线 -> True，暂停 -> False（恢复后改回 True）。
+# 标为离线的机器直接不写进来（10.107.238.7、10.200.100.103、10.107.226.31）。
 LOCAL_27B_ENDPOINTS = [
-    ("10.107.230.59", 8001),
-    ("10.107.230.59", 8002),
-    ("10.107.230.59", 8003),
-    ("10.107.230.59", 8004),
-    ("10.200.100.103", 8001),
-    ("10.200.100.103", 8002),
-    ("10.200.100.103", 8003),
-    ("10.200.100.103", 8004),
-    ("10.107.238.7", 8001),
-    ("10.107.238.7", 8002),
-    ("10.107.238.7", 8003),
-    ("10.107.238.7", 8004),
+    ("10.107.231.26", 8001, True),
+    ("10.107.231.26", 8002, True),
+    ("10.107.231.26", 8003, True),
+    ("10.107.231.26", 8004, False),   # 暂停
+    ("10.107.234.43", 8001, True),
+    ("10.107.234.43", 8002, True),
+    ("10.107.234.43", 8003, True),
+    ("10.107.234.43", 8004, True),
+    ("10.107.231.28", 8001, True),
+    ("10.107.231.28", 8002, True),
+    ("10.107.231.28", 8003, True),
+    ("10.107.231.28", 8004, True),
 ]
+
+# 服务端并发配的是 24，客户端只吃 8，留余量给别的调用方。
+LOCAL_27B_MAX_CONCURRENCY = 8
+
+# 按 128K 上下文估：扣掉 8192 输出还有约 12 万 token，按中文 1.2 字符/token 折算。
+# 宁可低估 —— 超了是服务端 400，白跑一次。
+CONTEXT_128K_PROMPT_CHARS = 140000
+CONTEXT_256K_PROMPT_CHARS = 300000
+CONTEXT_32K_PROMPT_CHARS = 28000
 
 
 def _local_27b_providers() -> list[dict]:
@@ -44,6 +55,7 @@ def _local_27b_providers() -> list[dict]:
             "url": f"http://{host}:{port}/v1/chat/completions",
             "model": "Qwen3.8-27B",
             "api_key": "local-pool-key",
+            "enabled": enabled,
             "stream": False,
             "temperature": 0.6,
             "max_tokens": 8192,
@@ -52,9 +64,59 @@ def _local_27b_providers() -> list[dict]:
             "capabilities": ["text", "image"],
             "task_types": TASK_TYPES,
             "weight": 1,
-            "max_concurrency": 16,
+            "max_concurrency": LOCAL_27B_MAX_CONCURRENCY,
+            "max_prompt_chars": CONTEXT_128K_PROMPT_CHARS,
         }
-        for host, port in LOCAL_27B_ENDPOINTS
+        for host, port, enabled in LOCAL_27B_ENDPOINTS
+    ]
+
+
+# 平台侧接入的模型。服务端并发 128，客户端吃 32。
+CLOUD_URL_TEMPLATE = (
+    "http://jb-aionlineinferenceservice-{job_id}-8000-nhss-job"
+    ".z2120.nhss.zhejianglab.com:31080/v1/chat/completions"
+)
+CLOUD_MAX_CONCURRENCY = 32
+
+# (name, job_id, api_key, capabilities, max_prompt_chars)
+CLOUD_ENDPOINTS = [
+    # 32K 上下文，装不下整页版面任务的 payload，只能接小 prompt 的文本任务。
+    ("Qwen3.8-Flash-Next", "161248564342717824", "Dz2xIZ3C8eMC6YX3_6sd81C1pSKwL3N5XEGp4aHwqfQ",
+     ["text", "image"], CONTEXT_32K_PROMPT_CHARS),
+    ("Qwen3.5-122B-A10B", "161249674027102080", "HjcAdBE1qv9BouiBCwu0SO0vgz2Rg7gCZPc2W--po5o",
+     ["text", "image"], CONTEXT_256K_PROMPT_CHARS),
+    ("Qwen3.8-27B", "161666866205977152", "34Lvm96deF5PAV_u4UEPt2HuhBqpO71LJx-ZOAismVY",
+     ["text", "image"], CONTEXT_128K_PROMPT_CHARS),
+    ("Qwen3.6-27B", "161930529585258368", "ZeJ4K0ut4BTNEfQOVKK0KkOB5du9mKadtLuj9twVwkg",
+     ["text", "image"], CONTEXT_128K_PROMPT_CHARS),
+    # 021SFM 两个没确认是否支持图片，先按纯文本接入；确认多模态后把 "image" 加回去，
+    # 否则图文任务会一路 400 再把实例打进冷却。
+    ("021SFM-Base", "162435476143237952", "Hv8XYlCM_fbqu6dA0J5YFh8p825BVlORKwb5S9o9J_s",
+     ["text"], CONTEXT_128K_PROMPT_CHARS),
+    ("021SFM-CoT", "162432138282557312", "h0XZESy4p4qg9AiBvOyHpHA-um8gU2Fjhn4Ev-KCXpI",
+     ["text"], CONTEXT_128K_PROMPT_CHARS),
+]
+
+
+def _cloud_providers() -> list[dict]:
+    return [
+        {
+            "name": name,
+            "model": name,
+            "url": CLOUD_URL_TEMPLATE.format(job_id=job_id),
+            "api_key": api_key,
+            "stream": False,
+            "temperature": 0.6,
+            "max_tokens": 8192,
+            "timeout": 2400,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "capabilities": list(capabilities),
+            "task_types": TASK_TYPES,
+            "weight": 1,
+            "max_concurrency": CLOUD_MAX_CONCURRENCY,
+            "max_prompt_chars": max_prompt_chars,
+        }
+        for name, job_id, api_key, capabilities, max_prompt_chars in CLOUD_ENDPOINTS
     ]
 
 
@@ -249,9 +311,9 @@ CFG = {
         "low_value": ["cover", "editorial_board", "table_of_contents", "references", "advertisement_or_notice", "blank"],
     },
     "runtime": {
-        "input_dir": "journal_cpt/data",
+        "input_dir": "/mnt/si003010kcx0/mmdata/domain_data/ZhiJiang/GI82航空知识1958-2025",
         "input_journals": [],
-        "output_root": "journal_cpt/outputs",
+        "output_root": "/mnt/si003010kcx0/mmdata/data_process/aviation_magazine",
         "recursive": True,
         "journal_workers": 1,
         "max_workers": 4,
@@ -297,6 +359,10 @@ CFG = {
         "skip_block_types": ["header", "footer", "page_number", "unknown"],
         "skip_text_patterns": [r"^\s*\d+\s*$", r"^\s*第?\s*\d+\s*页\s*$"],
     },
+    # 航空知识这批杂志不带水印，关掉这一步省掉每篇一次 pypdf 全量扫页。
+    # 注意：关掉之后 clean_pdf_watermarks 会在读 PDF 之前早退，
+    # 坏 PDF 的拦截改由 ensure_pdf_readable 负责（见 processing/watermark.py）。
+    "watermark": {"enabled": False},
     "mineru": {
         # 下面这些是所有 MinerU 实例共用的默认值；providers 里的条目只覆盖
         # url / server_url / max_concurrency 这类实例相关字段。
@@ -328,15 +394,15 @@ CFG = {
         "providers": [
             {
                 "name": "mineru_1",
-                "url": "http://10.107.226.27:8000",
-                "server_url": "http://10.107.226.27:30000",
+                "url": "http://10.107.231.26:9000",
+                "server_url": "http://10.107.231.26:30000",
                 "max_concurrency": 16,
                 "weight": 1,
             },
             {
                 "name": "mineru_2",
-                "url": "http://10.107.226.27:8001",
-                "server_url": "http://10.107.226.27:30001",
+                "url": "http://10.107.231.26:9001",
+                "server_url": "http://10.107.231.26:30001",
                 "max_concurrency": 16,
                 "weight": 1,
             },
@@ -346,69 +412,7 @@ CFG = {
         "strategy": "least_busy_weighted_fallback",
         "fallback": {"enabled": True, "max_attempts": 2, "cooldown_seconds": 300},
         "providers": [
-            {
-                "name": "Qwen3.8-27B-1",
-                "url": "http://jb-aionlineinferenceservice-161248564342717824-8000-nhss-job.z2120.nhss.zhejianglab.com:31080/v1/chat/completions",
-                "model": "Qwen3.8-27B",
-                "api_key_env": "",
-                "api_key": "624pLvSLzgNqsmZo9wmQgn_JjRVaTpmJ73IZPE8QMUg",
-                "stream": False,
-                "temperature": 0.4,
-                "max_tokens": 8192,
-                "timeout": 2400,
-                "chat_template_kwargs": {"enable_thinking": False},
-                "capabilities": ["text", "image"],
-                "task_types": TASK_TYPES,
-                "weight": 1,
-                "max_concurrency": 16,
-            },
-            {
-                "name": "Qwen3.5-122B-A10B",
-                "url": "http://jb-aionlineinferenceservice-161249674027102080-8000-nhss-job.z2120.nhss.zhejianglab.com:31080/v1/chat/completions",
-                "model": "Qwen3.5-122B-A10B",
-                "api_key_env": "",
-                "api_key": "HjcAdBE1qv9BouiBCwu0SO0vgz2Rg7gCZPc2W--po5o",
-                "stream": False,
-                "temperature": 0.6,
-                "max_tokens": 8192,
-                "timeout": 2400,
-                "capabilities": ["text", "image"],
-                "task_types": TASK_TYPES,
-                "weight": 2,
-                "max_concurrency": 16,
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
-            {
-                "name": "Qwen3.8-2.4T-A95B-FP8",
-                "url": "http://jb-aionlineinferenceservice-161253868802961280-8000-nhss-job.z2120.nhss.zhejianglab.com:31080/v1/chat/completions",
-                "model": "Qwen3.8-2.4T-A95B-FP8",
-                "api_key": "lA31fl6wllSbTun-LOtNF9FJcKOCtvBntaWW3wxjePA",
-                "stream": False,
-                "temperature": 0.6,
-                "max_tokens": 8192,
-                "timeout": 2400,
-                "chat_template_kwargs": {"enable_thinking": False},
-                "capabilities": ["text", "image"],
-                "task_types": TASK_TYPES,
-                "weight": 3,
-                "max_concurrency": 16,
-            },
-
-            {
-                "name": "Qwen3.8-27B-2",
-                "url": "http://jb-aionlineinferenceservice-161666866205977152-8000-nhss-job.z2120.nhss.zhejianglab.com:31080/v1/chat/completions",
-                "model": "Qwen3.8-27B",
-                "api_key": "34Lvm96deF5PAV_u4UEPt2HuhBqpO71LJx-ZOAismVY",
-                "stream": False,
-                "temperature": 0.6,
-                "max_tokens": 8192,
-                "timeout": 2400,
-                "chat_template_kwargs": {"enable_thinking": False},
-                "capabilities": ["text", "image"],
-                "task_types": TASK_TYPES,
-                "weight": 3,
-                "max_concurrency": 16,
-            },
+            *_cloud_providers(),
             *_local_27b_providers(),
         ],
     },

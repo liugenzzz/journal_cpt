@@ -219,25 +219,100 @@ class ProviderNameUniquenessTests(unittest.TestCase):
         pool = VlmPool.from_config(cfg, cfg["prompts"])
         self.assertEqual([c.name for c in pool.clients], ["a-8001", "b-8002"])
 
-    def test_shipped_config_has_unique_names(self) -> None:
+    def _shipped_pool(self):
         from journal_cpt.core.config_loader import load_config
 
         cfg = load_config()
-        pool = VlmPool.from_config(cfg, cfg["prompts"])
+        return VlmPool.from_config(cfg, cfg["prompts"])
+
+    def test_shipped_config_has_unique_names(self) -> None:
+        pool = self._shipped_pool()
         names = [client.name for client in pool.clients]
         self.assertEqual(len(names), len(set(names)), f"重名: {names}")
-        self.assertEqual(len(names), 16)
-        self.assertEqual(sum(client.max_concurrency for client in pool.clients), 256)
+
+    def test_shipped_pool_composition(self) -> None:
+        pool = self._shipped_pool()
+        cloud = [c for c in pool.clients if "zhejianglab" in c.cfg["url"]]
+        local = [c for c in pool.clients if c.cfg["url"].startswith("http://10.")]
+        self.assertEqual(len(cloud), 6)
+        self.assertEqual(len(local), 11, "只接在线实例；暂停的 231.26:8004 不该进池")
+        # 服务端并发：本地 24 用 8，云端 128 用 32
+        self.assertTrue(all(c.max_concurrency == 32 for c in cloud))
+        self.assertTrue(all(c.max_concurrency == 8 for c in local))
+        self.assertEqual(sum(c.max_concurrency for c in pool.clients), 280)
+
+    def test_offline_and_paused_endpoints_are_excluded(self) -> None:
+        pool = self._shipped_pool()
+        urls = " ".join(c.cfg["url"] for c in pool.clients)
+        for gone in ("10.107.238.7", "10.200.100.103", "10.107.226.31", "10.107.231.26:8004"):
+            self.assertNotIn(gone, urls, f"{gone} 已离线/暂停，不该出现在池里")
 
     def test_local_pool_keeps_the_real_model_name(self) -> None:
-        from journal_cpt.core.config_loader import load_config
-
-        cfg = load_config()
-        pool = VlmPool.from_config(cfg, cfg["prompts"])
+        pool = self._shipped_pool()
         local = [c for c in pool.clients if c.cfg["url"].startswith("http://10.")]
-        self.assertEqual(len(local), 12)
         for client in local:
             self.assertEqual(client.model, "Qwen3.8-27B")
             self.assertEqual(client.cfg["api_key"], "local-pool-key")
             self.assertEqual(client.cfg["max_tokens"], 8192)
             self.assertEqual(client.cfg["chat_template_kwargs"], {"enable_thinking": False})
+
+    def test_context_windows_map_to_prompt_budgets(self) -> None:
+        pool = self._shipped_pool()
+        by_name = {c.name: c for c in pool.clients}
+        self.assertEqual(by_name["Qwen3.8-Flash-Next"].max_prompt_chars, 28000)    # 32K
+        self.assertEqual(by_name["Qwen3.5-122B-A10B"].max_prompt_chars, 300000)    # 256K
+        self.assertEqual(by_name["Qwen3.8-27B"].max_prompt_chars, 140000)          # 128K
+
+    def test_021sfm_is_registered_text_only(self) -> None:
+        pool = self._shipped_pool()
+        for name in ("021SFM-Base", "021SFM-CoT"):
+            client = next(c for c in pool.clients if c.name == name)
+            self.assertNotIn("image", client.capabilities, "未确认多模态前不该接图文任务")
+            self.assertFalse(client.supports("figure_table_formula_to_text", has_images=True))
+            self.assertTrue(client.supports("section_keypoint_summary", has_images=False))
+
+
+class PromptBudgetRoutingTests(unittest.TestCase):
+    """上下文窗口小的实例不该收大 payload —— 发过去只会换回一个 400。"""
+
+    def _pool(self, budgets):
+        clients = [
+            _PooledVlmClient(
+                _FakeClient(f"p{i}"),
+                {"name": f"p{i}", "model": f"p{i}", "max_concurrency": 4,
+                 "task_types": [], "capabilities": ["text"], "max_prompt_chars": b},
+            )
+            for i, b in enumerate(budgets)
+        ]
+        return VlmPool(clients, cooldown_seconds=0.0), clients
+
+    def test_small_prompt_can_use_the_small_provider(self) -> None:
+        pool, clients = self._pool([1000, 100000])
+        pool.chat("t", "x" * 500)
+        self.assertEqual(sum(c.client.calls for c in clients), 1)
+
+    def test_large_prompt_skips_the_small_provider(self) -> None:
+        pool, clients = self._pool([1000, 100000])
+        response = pool.chat("t", "x" * 5000)
+        self.assertEqual(response.provider_name, "p1")
+        self.assertEqual(clients[0].client.calls, 0, "装不下的实例不该被选中")
+
+    def test_prompt_beyond_every_provider_raises_a_clear_error(self) -> None:
+        pool, _ = self._pool([1000, 2000])
+        with self.assertRaises(RuntimeError) as ctx:
+            pool.chat("t", "x" * 50000)
+        message = str(ctx.exception)
+        self.assertIn("Prompt too long", message)
+        self.assertIn("prompt_chars=50000", message)
+        self.assertIn("largest_provider_budget=2000", message)
+
+    def test_zero_budget_means_unlimited(self) -> None:
+        pool, clients = self._pool([0])
+        pool.chat("t", "x" * 999999)
+        self.assertEqual(clients[0].client.calls, 1)
+
+    def test_capability_error_is_distinct_from_size_error(self) -> None:
+        pool, _ = self._pool([100000])
+        with self.assertRaises(RuntimeError) as ctx:
+            pool.chat("t", "x" * 10, images=[__import__("pathlib").Path("a.png")])
+        self.assertIn("image-capable", str(ctx.exception))
