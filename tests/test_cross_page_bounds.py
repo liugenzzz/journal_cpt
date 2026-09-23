@@ -24,13 +24,13 @@ def _cfg(window=3, min_images=2, max_images=3) -> dict:
 
 
 class CrossPageBoundsTests(unittest.TestCase):
-    def test_shipped_config_allows_two_and_three_pages(self) -> None:
+    def test_shipped_config_allows_two_to_five_pages(self) -> None:
         cfg = load_config()
-        self.assertEqual(cross_page_image_bounds(cfg), (2, 3))
+        self.assertEqual(cross_page_image_bounds(cfg), (2, 5))
         self.assertFalse(_cross_page_images_ok(_sample(1), cfg))
-        self.assertTrue(_cross_page_images_ok(_sample(2), cfg))
-        self.assertTrue(_cross_page_images_ok(_sample(3), cfg))
-        self.assertFalse(_cross_page_images_ok(_sample(4), cfg))
+        for n in (2, 3, 4, 5):
+            self.assertTrue(_cross_page_images_ok(_sample(n), cfg), f"{n} 页应被接受")
+        self.assertFalse(_cross_page_images_ok(_sample(6), cfg))
 
     def test_raising_max_images_takes_effect(self) -> None:
         cfg = _cfg(window=5, min_images=2, max_images=5)
@@ -86,11 +86,12 @@ class QualityFallbackFollowsConfigTests(unittest.TestCase):
         self.assertTrue(validation._cross_page_images_ok(sample, cfg))
         self.assertEqual(validation.cross_page_image_bounds(cfg), (2, 5))
 
-    def test_five_page_sample_rejected_under_default_config(self) -> None:
+    def test_six_page_sample_rejected_under_shipped_config(self) -> None:
         from journal_cpt.tasks import validation
 
         cfg = load_config()
-        self.assertFalse(validation._cross_page_images_ok(self._quality_sample(5), cfg))
+        self.assertTrue(validation._cross_page_images_ok(self._quality_sample(5), cfg))
+        self.assertFalse(validation._cross_page_images_ok(self._quality_sample(6), cfg))
 
 
 if __name__ == "__main__":

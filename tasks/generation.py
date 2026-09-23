@@ -150,7 +150,7 @@ TASK_SPECS: dict[str, dict[str, Any]] = {
         "format": "sharegpt",
         "input_fields": ["page_images", "page_texts"],
         "output_fields": ["page_visual_descriptions", "context_topic", "page_roles", "cross_page_summary", "continuity_relations", "figures_tables_formulas", "key_points_by_page"],
-        "quality_rules": ["必须依赖至少两页证据；输入图片应为 2-3 张连续页面图；回答要覆盖跨页正文、图表/表格/公式和页面间承接关系，无清晰关联时返回 []。"],
+        "quality_rules": ["必须依赖至少两页证据；输入图片应为 2-5 张连续页面图；回答要覆盖跨页正文、图表/表格/公式和页面间承接关系，无清晰关联时返回 []。"],
     },
     "domain_knowledge_corpus": {
         "format": "pt",
@@ -428,7 +428,7 @@ def _template_input(job: JournalSampleJob, cfg: dict[str, Any]) -> dict[str, Any
             "page_images": list(job.images[:3]),
             "page_texts": _page_texts(job, int(cfg["generation"]["max_neighbor_context_chars"])),
             "article_title": job.page.article_title,
-            "image_count_policy": "Use 2-3 page images for this task.",
+            "image_count_policy": "Use 2-5 page images for this task.",
         }
     return {"source_text": truncate_text(job.page.full_text, max_page_chars)}
 
@@ -624,7 +624,7 @@ def _prompt(job: JournalSampleJob, cfg: dict[str, Any]) -> str:
             )
     elif job.task_type == "cross_page_article_context":
         instruction_rule += (
-            " 必须逐页观察 2-3 张连续页面图像，生成 page_visual_descriptions；"
+            " 必须逐页观察 2-5 张连续页面图像，生成 page_visual_descriptions；"
             "问题要指向这些连续页面的上下文衔接，答案要覆盖各页主要正文、图表/表格/公式和跨页承接关系。"
         )
     return f"{prompt}\n\n{instruction_rule}\n\n{JSON_OUTPUT_INSTRUCTION}\n\nInput JSON:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"

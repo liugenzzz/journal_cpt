@@ -234,12 +234,12 @@ class ProviderNameUniquenessTests(unittest.TestCase):
         pool = self._shipped_pool()
         cloud = [c for c in pool.clients if "zhejianglab" in c.cfg["url"]]
         local = [c for c in pool.clients if c.cfg["url"].startswith("http://10.")]
-        self.assertEqual(len(cloud), 6)
+        self.assertEqual(len(cloud), 5, "Flash-Next 只有 32K，装不下当前 payload，已移除")
         self.assertEqual(len(local), 11, "只接在线实例；暂停的 231.26:8004 不该进池")
         # 服务端并发：本地 24 用 8，云端 128 用 32
         self.assertTrue(all(c.max_concurrency == 32 for c in cloud))
         self.assertTrue(all(c.max_concurrency == 8 for c in local))
-        self.assertEqual(sum(c.max_concurrency for c in pool.clients), 280)
+        self.assertEqual(sum(c.max_concurrency for c in pool.clients), 248)
 
     def test_offline_and_paused_endpoints_are_excluded(self) -> None:
         pool = self._shipped_pool()
@@ -259,7 +259,7 @@ class ProviderNameUniquenessTests(unittest.TestCase):
     def test_context_windows_map_to_prompt_budgets(self) -> None:
         pool = self._shipped_pool()
         by_name = {c.name: c for c in pool.clients}
-        self.assertEqual(by_name["Qwen3.8-Flash-Next"].max_prompt_chars, 28000)    # 32K
+        self.assertNotIn("Qwen3.8-Flash-Next", by_name, "32K 的实例当前接不了任何任务")
         self.assertEqual(by_name["Qwen3.5-122B-A10B"].max_prompt_chars, 300000)    # 256K
         self.assertEqual(by_name["Qwen3.8-27B"].max_prompt_chars, 140000)          # 128K
 

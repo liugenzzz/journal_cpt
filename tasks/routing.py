@@ -281,6 +281,7 @@ def build_sample_jobs(
     cross_max_images = max(cross_min_images, int(routing.get("cross_page_max_images", 3)))
     cross_window = min(max(cross_min_images, int(routing.get("cross_page_window", cross_max_images))), cross_max_images)
     article_window = int(routing.get("article_window", 8))
+    skip_layout_types = set(routing.get("skip_layout_page_types", ["blank"]))
     method_keywords = list(routing.get("method_keywords", []))
     claim_keywords = list(routing.get("claim_keywords", []))
     conclusion_keywords = list(routing.get("conclusion_keywords", []))
@@ -290,7 +291,7 @@ def build_sample_jobs(
         has_page_text = len(page_text) >= min_page_text
         article = article_map.get(page.article_id)
 
-        if _enabled(enabled, "page_to_journal_layout_description") and page.page_type != "blank":
+        if _enabled(enabled, "page_to_journal_layout_description") and page.page_type not in skip_layout_types:
             jobs.append(
                 JournalSampleJob(
                     "page_to_journal_layout_description",

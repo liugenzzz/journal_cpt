@@ -80,9 +80,9 @@ CLOUD_MAX_CONCURRENCY = 32
 
 # (name, job_id, api_key, capabilities, max_prompt_chars)
 CLOUD_ENDPOINTS = [
-    # 32K 上下文，装不下整页版面任务的 payload，只能接小 prompt 的文本任务。
-    ("Qwen3.8-Flash-Next", "161248564342717824", "Dz2xIZ3C8eMC6YX3_6sd81C1pSKwL3N5XEGp4aHwqfQ",
-     ["text", "image"], CONTEXT_32K_PROMPT_CHARS),
+    # Qwen3.8-Flash-Next（job 161248564342717824）只有 32K 上下文，扣掉 8192 输出后
+    # 约 28000 字符预算，而各任务 payload 是 38K-56K 字符，一个都接不了，已移除。
+    # 后续若把 payload 压到 28000 以内，按下面的格式加回来即可。
     ("Qwen3.5-122B-A10B", "161249674027102080", "HjcAdBE1qv9BouiBCwu0SO0vgz2Rg7gCZPc2W--po5o",
      ["text", "image"], CONTEXT_256K_PROMPT_CHARS),
     ("Qwen3.8-27B", "161666866205977152", "34Lvm96deF5PAV_u4UEPt2HuhBqpO71LJx-ZOAismVY",
@@ -410,10 +410,32 @@ CFG = {
     },
     "vlm_pool": {
         "strategy": "least_busy_weighted_fallback",
-        "fallback": {"enabled": True, "max_attempts": 2, "cooldown_seconds": 300},
+        "fallback": {"enabled": True, "max_attempts": 2, "cooldown_seconds": 400},
         "providers": [
             *_cloud_providers(),
             *_local_27b_providers(),
+        ],
+    },
+    # 杂志是买来的整期扫描件，里面夹着订阅广告、杂志社声明、二维码推广页，
+    # 这些页对训练是纯噪声。命中的页会被判成 advertisement_or_notice，
+    # 而该类型本来就在 low_value_page_types 里，会被路由和校验一起过滤掉。
+    #
+    # 判定要求同时命中 min_signals 个不同的特征；正文很长的页需要 strong_signals 个，
+    # 避免正文里偶然提到"电话""网址"就被误杀。
+    "page_noise": {
+        "enabled": True,
+        "min_signals": 2,
+        "strong_signals": 4,
+        "max_text_chars": 1200,
+        "patterns": [
+            r"杂志社声明", r"本刊声明", r"郑重声明",
+            r"邮发代号", r"订阅", r"邮购", r"汇款", r"发行部", r"编辑部电话",
+            r"广告经营许可", r"广告服务", r"扫码关注", r"二维码", r"微信公众号",
+            r"微信[:：]", r"微店", r"淘宝", r"京东",
+            r"全年\s*\d+\s*期", r"定价[:：]?\s*\d", r"零售价", r"单价",
+            r"盗版", r"版权所有", r"侵权必究",
+            r"0\d{2,3}-\d{7,8}", r"www\.[A-Za-z0-9.-]+\.(?:com|cn|net|org)",
+            r"QQ\s*[:：]?\s*\d{5,}", r"投稿邮箱", r"征订",
         ],
     },
     "routing": {
@@ -423,9 +445,9 @@ CFG = {
         "min_section_text_chars": 220,
         "min_article_text_chars": 800,
         "min_domain_corpus_text_chars": 300,
-        "cross_page_window": 3,
+        "cross_page_window": 5,
         "cross_page_min_images": 2,
-        "cross_page_max_images": 3,
+        "cross_page_max_images": 5,
         "article_window": 8,
         "domain_corpus_window": 2,
         "domain_corpus_target_input_chars": 3600,
@@ -435,6 +457,9 @@ CFG = {
         "caption_block_types": ["figure_caption", "table_caption"],
         "ocr_block_types": ["title", "section_title", "text", "figure_caption", "table_caption", "table", "formula", "list"],
         "low_value_page_types": ["cover", "editorial_board", "table_of_contents", "references", "advertisement_or_notice", "blank"],
+        # 版面描述任务本来对低价值页也生成（封面/目录的版面仍有价值），
+        # 但广告页和空白页连版面都不值得描述。
+        "skip_layout_page_types": ["blank", "advertisement_or_notice"],
         "method_keywords": ["方法", "模型", "试验", "实验", "仿真", "工况", "计算", "参数", "边界条件", "评价指标", "测量", "流程"],
         "claim_keywords": ["结果", "表明", "说明", "证明", "可见", "因此", "结论", "提高", "降低", "影响", "满足", "验证"],
         "conclusion_keywords": ["结论", "贡献", "发现", "结果表明", "研究表明", "提出", "建立", "验证"],
@@ -450,7 +475,7 @@ CFG = {
         "max_related_context_blocks": 8,
         # prompt 装配后的字符预算。服务端 max_model_len=131072 token，
         # 这里留足输出和图片 token 的余量；超了会按体积省略 context 下的辅助字段。
-        "max_prompt_chars": 80000,
+        "max_prompt_chars": 100000,
         "max_image_bytes": 2097152,
         "max_image_side": 1600,
         "image_jpeg_quality": 85,

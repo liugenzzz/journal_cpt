@@ -651,7 +651,45 @@ def _two_column_left_then_right_ok(blocks: list[JournalBlockRecord], column_mode
     return has_left and has_right
 
 
-def _page_type(page_no: int, text: str, blocks: list[JournalBlockRecord], column_mode: str) -> str:
+def _noise_signal_count(compact: str, cfg: dict[str, Any]) -> int:
+    """命中了几种不同的广告/声明特征。"""
+    noise_cfg = cfg.get("page_noise", {})
+    hits = 0
+    for pattern in noise_cfg.get("patterns", []):
+        try:
+            if re.search(str(pattern), compact, flags=re.IGNORECASE):
+                hits += 1
+        except re.error:
+            continue
+    return hits
+
+
+def _looks_like_advertisement(compact: str, cfg: dict[str, Any]) -> bool:
+    """订阅广告、杂志社声明、二维码推广页 —— 买来的整期扫描件里夹带的噪声。
+
+    要求命中多个不同特征：正文里偶尔出现一个"网址"或"电话"是正常的，
+    但同时出现"邮发代号 + 定价 + 微信 + 声明"就基本只能是广告页。
+    """
+    noise_cfg = cfg.get("page_noise", {})
+    if not bool(noise_cfg.get("enabled", True)):
+        return False
+    min_signals = max(1, int(noise_cfg.get("min_signals", 2)))
+    strong_signals = max(min_signals, int(noise_cfg.get("strong_signals", 4)))
+    max_text_chars = max(0, int(noise_cfg.get("max_text_chars", 1200)))
+    hits = _noise_signal_count(compact, cfg)
+    if hits >= strong_signals:
+        return True
+    return hits >= min_signals and len(compact) <= max_text_chars
+
+
+def _page_type(
+    page_no: int,
+    text: str,
+    blocks: list[JournalBlockRecord],
+    column_mode: str,
+    cfg: dict[str, Any] | None = None,
+) -> str:
+    cfg = cfg or {}
     compact = clean_text(text)
     if len(compact) < 8 and not blocks:
         return "blank"
@@ -663,6 +701,9 @@ def _page_type(page_no: int, text: str, blocks: list[JournalBlockRecord], column
         return "editorial_board"
     if re.search(r"(^|\s)(参考文献|References)\s*$", compact, flags=re.IGNORECASE) or compact.startswith("参考文献"):
         return "references"
+    # 广告/声明页要在"正文页"判定之前拦下，否则字数够长就会被当成 article_body。
+    if _looks_like_advertisement(compact, cfg):
+        return "advertisement_or_notice"
     if page_no == 1 and not re.search(r"(摘要|关键词|Abstract|Key\s*words?)", compact, flags=re.IGNORECASE):
         if re.search(r"(主管|主办|出版|ISSN|CN\s*\d+|第\s*\d+\s*卷)", compact, flags=re.IGNORECASE):
             return "cover"
@@ -1018,7 +1059,7 @@ def _build_page(
     ordered = _recover_reading_order(blocks, column_mode)
     blocks = _sort_blocks_in_reading_order(ordered)
     raw_text = "\n".join(block.text for block in ordered if clean_text(block.text))
-    page_type = _page_type(page_no, raw_text, blocks, column_mode)
+    page_type = _page_type(page_no, raw_text, blocks, column_mode, cfg)
     visible_text = "\n".join(block.text for block in ordered if clean_text(block.text) and not _skip_from_train_text(block, page_type))
     page = JournalPageRecord(
         journal_id=journal.journal_id,
